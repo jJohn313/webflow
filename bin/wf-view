@@ -67,14 +67,14 @@ class WebflowViewer(Gtk.Window):
         self.pending_g = False
         self.search_text = ""
 
-        # Paths
+        # Paths: Always use per-domain session storage so logins persist seamlessly
+        # between Ephemeral mode and Workbenches!
         self.base_share = Path.home() / ".local" / "share" / "webflow"
+        self.session_dir = self.base_share / "sessions" / self.root_domain
         if self.workbench:
             safe_wb = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.workbench.strip())
-            self.session_dir = self.base_share / "sessions" / "workbenches" / safe_wb
             self.wb_manifest = self.base_share / "workbenches" / f"{safe_wb}.json"
         else:
-            self.session_dir = self.base_share / "sessions" / self.root_domain
             self.wb_manifest = None
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +201,26 @@ class WebflowViewer(Gtk.Window):
 
     def on_title_changed(self, view, param):
         self.update_title()
+        page_title = self.web_view.get_title()
+        uri = self.web_view.get_uri()
+        if page_title and uri:
+            self.update_history_title(uri, page_title)
+
+    def update_history_title(self, uri: str, title: str):
+        hist_jsonl = self.base_share / "history.jsonl"
+        if not hist_jsonl.exists():
+            return
+        try:
+            lines = hist_jsonl.read_text(encoding="utf-8").splitlines()
+            if not lines:
+                return
+            last = json.loads(lines[-1])
+            if last.get("url") == uri or self.root_domain in last.get("url", ""):
+                last["title"] = title
+                lines[-1] = json.dumps(last)
+                hist_jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass
 
     def on_uri_changed(self, view, param):
         uri = self.web_view.get_uri() or ""

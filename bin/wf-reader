@@ -9,6 +9,7 @@ import re
 import html
 import shutil
 import textwrap
+import curses
 import urllib.request
 import urllib.parse
 import subprocess
@@ -354,61 +355,170 @@ def bookmark(url: str, title: str):
     print(f"\n[+] Bookmarked: {url} | {title}")
 
 
+ANSI_SPLIT_RE = re.compile(r"(\033\[[0-9;]*m)")
+
+def parse_ansi_line(line: str):
+    """Converts ANSI escape codes from render_markdown_to_ansi into curses attributes."""
+    segments = []
+    attr = curses.A_NORMAL
+    parts = ANSI_SPLIT_RE.split(line)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("\033["):
+            code = part[2:-1]
+            if code == "0":
+                attr = curses.A_NORMAL
+            elif code == "1":
+                attr |= curses.A_BOLD
+            elif code == "2":
+                attr |= curses.A_DIM
+            elif code == "3":
+                attr |= getattr(curses, "A_ITALIC", curses.A_NORMAL)
+            elif code == "36":
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(1)
+            elif code == "32":
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(2)
+            elif code == "33":
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(3)
+            elif code == "35":
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(4)
+        else:
+            segments.append((part, attr))
+    return segments
+
+
 def run_interactive_reader(url: str, title: str, md_text: str, links: list):
     ansi_doc = render_markdown_to_ansi(title, url, md_text, links)
+    raw_lines = ansi_doc.splitlines()
 
-    # Display in interactive pager with ANSI colors enabled
-    if shutil.which("less"):
-        proc = subprocess.Popen(
-            ["less", "-R", "-f", "-Q", "-P", f" Webflow Reader: {title[:40]} (j/k scroll, q actions) "],
-            stdin=subprocess.PIPE
-        )
-        proc.communicate(input=ansi_doc.encode("utf-8"))
-    elif shutil.which("bat"):
-        proc = subprocess.Popen(["bat", "--style=plain", "--paging=always"], stdin=subprocess.PIPE)
-        proc.communicate(input=ansi_doc.encode("utf-8"))
-    else:
-        print(ansi_doc)
+    action_After = {"type": None, "payload": None}
 
-    # Action loop after exiting pager
-    while True:
-        print("\033[36m" + "─" * 64 + "\033[0m")
-        print(f"  \033[1m{title}\033[0m")
-        print("  \033[33m[1..N]\033[0m Follow Link #   \033[33m[E]\033[0m Escalate to GUI (wf-view)   \033[33m[r]\033[0m Re-read")
-        print("  \033[33m[b]\033[0m    Bookmark        \033[33m[s]\033[0m Save Markdown           \033[33m[q/Enter]\033[0m Quit")
-        print("\033[36m" + "─" * 64 + "\033[0m")
-
+    def _curses_reader(stdscr):
         try:
-            choice = input("wf-reader > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
-        if not choice or choice.lower() == "q":
-            break
-        elif choice.lower() == "r":
-            return run_interactive_reader(url, title, md_text, links)
-        elif choice.lower() == "e":
-            wf_view_bin = Path(__file__).resolve().parent / "wf-view"
-            subprocess.Popen([str(wf_view_bin), url], start_new_session=True)
-            break
-        elif choice.lower() == "b":
-            bookmark(url, title)
-        elif choice.lower() == "s":
-            save_dir = Path.home() / "Documents" / "Webflow"
-            save_dir.mkdir(parents=True, exist_ok=True)
-            safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
-            target_file = save_dir / f"{safe_title}.md"
-            target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
-            print(f"[+] Saved to: {target_file}")
-        elif choice.isdigit():
-            num = int(choice)
-            match = [l for l in links if l[0] == num]
-            if match:
-                target_link = match[0][2]
-                wf_open_bin = Path(__file__).resolve().parent / "wf-open"
-                os.execv(str(wf_open_bin), [str(wf_open_bin), target_link])
+        parsed_lines = [parse_ansi_line(l) for l in raw_lines]
+        scroll_y = 0  # ALWAYS starts at top of document (line 0)
+        link_buf = ""
+        status_note = ""
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            view_h = max(1, h - 2)
+            max_scroll = max(0, len(parsed_lines) - view_h)
+            scroll_y = max(0, min(scroll_y, max_scroll))
+
+            # Render visible lines from scroll_y
+            for row_idx in range(view_h):
+                line_idx = scroll_y + row_idx
+                if line_idx >= len(parsed_lines):
+                    break
+                x = 0
+                for text_seg, attr in parsed_lines[line_idx]:
+                    if x >= w - 1:
+                        break
+                    clipped = text_seg[: max(0, w - 1 - x)]
+                    try:
+                        stdscr.addstr(row_idx, x, clipped, attr)
+                    except curses.error:
+                        pass
+                    x += len(clipped)
+
+            # Top/Bottom progress percentage
+            pct = int((scroll_y / max_scroll) * 100) if max_scroll > 0 else 100
+            pos_label = "TOP" if scroll_y == 0 else ("BOT" if scroll_y >= max_scroll else f"{pct:2d}%")
+
+            # Status & Action Bar at bottom
+            bar1 = f" 📖 {title[:w-25]} ".ljust(w - 12) + f" [{pos_label}] "
+            if link_buf:
+                bar2 = f" Follow Link #{link_buf}_  (Press Enter to open, Esc to cancel)"
+            elif status_note:
+                bar2 = f" {status_note}  |  j/k Scroll  d/u Half-Page  1-9 Link#  E GUI  b Bookmark  s Save  q Quit"
             else:
-                print(f"[-] Link [{num}] not found (valid range: 1..{len(links)}).")
+                bar2 = " j/k Scroll  |  d/u Page  |  g/G Top/Bot  |  0-9 Follow Link  |  E GUI  |  b Mark  |  s Save  |  q Quit"
+
+            try:
+                stdscr.addstr(h - 2, 0, bar1[:w - 1].ljust(w - 1), curses.color_pair(5) | curses.A_BOLD)
+                stdscr.addstr(h - 1, 0, bar2[:w - 1].ljust(w - 1), curses.A_BOLD)
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if link_buf:
+                if key in (10, 13):  # Enter
+                    try:
+                        num = int(link_buf)
+                    except ValueError:
+                        num = -1
+                    link_buf = ""
+                    match = [l for l in links if l[0] == num]
+                    if match:
+                        action_After["type"] = "link"
+                        action_After["payload"] = match[0][2]
+                        break
+                    else:
+                        status_note = f"[-] Link [{num}] not found (1..{len(links)})"
+                elif key == 27:  # Escape
+                    link_buf = ""
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    link_buf = link_buf[:-1]
+                elif ord('0') <= key <= ord('9'):
+                    link_buf += chr(key)
+                continue
+
+            status_note = ""
+            if key in (ord('q'), ord('Q'), 27):
+                break
+            elif key in (ord('j'), curses.KEY_DOWN, 10, 13):
+                scroll_y += 1
+            elif key in (ord('k'), curses.KEY_UP):
+                scroll_y -= 1
+            elif key in (ord('d'), curses.KEY_NPAGE, ord(' ')):
+                scroll_y += view_h // 2
+            elif key in (ord('u'), curses.KEY_PPAGE):
+                scroll_y -= view_h // 2
+            elif key == ord('g') or key == curses.KEY_HOME:
+                scroll_y = 0
+            elif key == ord('G') or key == curses.KEY_END:
+                scroll_y = max_scroll
+            elif key in (ord('e'), ord('E')):
+                action_After["type"] = "escalate"
+                break
+            elif key in (ord('b'), ord('B')):
+                bookmark(url, title)
+                status_note = "[+] Bookmarked page!"
+            elif key in (ord('s'), ord('S')):
+                save_dir = Path.home() / "Documents" / "Webflow"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
+                target_file = save_dir / f"{safe_title}.md"
+                target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
+                status_note = f"[+] Saved to ~/Documents/Webflow/{safe_title}.md"
+            elif ord('1') <= key <= ord('9'):
+                link_buf = chr(key)
+
+    curses.wrapper(_curses_reader)
+
+    if action_After["type"] == "escalate":
+        wf_view_bin = Path(__file__).resolve().parent / "wf-view"
+        subprocess.Popen([str(wf_view_bin), url], start_new_session=True)
+    elif action_After["type"] == "link" and action_After["payload"]:
+        wf_open_bin = Path(__file__).resolve().parent / "wf-open"
+        os.execv(str(wf_open_bin), [str(wf_open_bin), action_After["payload"]])
 
 
 def main():
