@@ -29,43 +29,106 @@ def ensure_dirs():
 
 
 def fetch_search(query: str):
-    if not query.strip():
+    query = query.strip()
+    if not query:
         return []
+
     import html as html_module
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
-    url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query.strip())
-    req = urllib.request.Request(url, headers=headers)
+    results = []
+
+    # 1. Direct URL detection (e.g., wikipedia.org, https://...)
+    direct_url = None
+    if " " not in query:
+        if query.startswith(("http://", "https://")):
+            direct_url = query
+        elif "." in query and not query.endswith("."):
+            parts = query.split("/")
+            domain = parts[0]
+            if "." in domain and len(domain.split(".")[-1]) >= 2:
+                direct_url = "https://" + query
+
+    if direct_url:
+        results.append({
+            "title": f"➜ Direct: {direct_url}",
+            "url": direct_url,
+            "snippet": f"Open {direct_url} directly",
+            "domain": urllib.parse.urlparse(direct_url).netloc
+        })
+
+    # 2. Primary Web Search: DuckDuckGo Lite via POST (never CAPTCHA-blocked)
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://lite.duckduckgo.com/",
+            "Origin": "https://lite.duckduckgo.com",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
             content = resp.read().decode("utf-8", errors="replace")
 
-        links = re.findall(r'<a[^>]+href=[\'\"](https?://[^\'\"]+)[\'\"][^>]*>(.*?)</a>', content)
+        links = re.findall(r'<a[^>]+href=[\'\"](https?://[^\'\"]+)[\'\"][^>]*class=[\'\"]result-link[\'\"][^>]*>(.*?)</a>', content)
         snippets = re.findall(r'<td class=[\'\"]result-snippet[\'\"]>(.*?)</td>', content, re.DOTALL)
 
-        results = []
-        clean_links = []
-        for u, title_raw in links:
-            if "duckduckgo.com" not in u and not u.startswith("/"):
-                t = html_module.unescape(re.sub(r'<[^>]+>', '', title_raw).strip())
-                if len(t) > 2:
-                    clean_links.append((u, t))
-
-        for i, (u, title) in enumerate(clean_links[:25]):
-            snip = ""
-            if i < len(snippets):
-                snip = html_module.unescape(re.sub(r'<[^>]+>', '', snippets[i]).strip())
+        for i, (u, raw_t) in enumerate(links[:25]):
+            t = html_module.unescape(re.sub(r'<[^>]+>', '', raw_t)).strip()
+            s = html_module.unescape(re.sub(r'<[^>]+>', '', snippets[i])).strip() if i < len(snippets) else ''
             results.append({
-                "title": title,
+                "title": t,
                 "url": u,
-                "snippet": snip,
+                "snippet": s,
                 "domain": urllib.parse.urlparse(u).netloc
             })
-        return results
-    except Exception as e:
-        return [{"title": "Search Error", "url": "", "snippet": str(e), "domain": ""}]
+    except Exception:
+        pass
+
+    # 3. Fallback Tier 1: DuckDuckGo Instant Answer API
+    if len(results) <= (1 if direct_url else 0):
+        try:
+            api_url = "https://api.duckduckgo.com/?q=" + urllib.parse.quote(query) + "&format=json&no_html=1"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+                if d.get("AbstractURL"):
+                    results.append({
+                        "title": d.get("Heading") or query,
+                        "url": d.get("AbstractURL"),
+                        "snippet": d.get("AbstractText", ""),
+                        "domain": urllib.parse.urlparse(d.get("AbstractURL")).netloc
+                    })
+                for t in d.get("RelatedTopics", []):
+                    if "FirstURL" in t:
+                        results.append({
+                            "title": t.get("Text", "")[:60],
+                            "url": t.get("FirstURL"),
+                            "snippet": t.get("Text", ""),
+                            "domain": urllib.parse.urlparse(t.get("FirstURL")).netloc
+                        })
+        except Exception:
+            pass
+
+    # 4. Fallback Tier 2: Wikipedia OpenSearch API
+    if len(results) <= (1 if direct_url else 0):
+        try:
+            wiki_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(query)}&limit=10&namespace=0&format=json"
+            req = urllib.request.Request(wiki_url, headers={"User-Agent": "Webflow/0.2"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                w_data = json.loads(resp.read().decode("utf-8"))
+                if len(w_data) >= 4:
+                    titles, snips, urls = w_data[1], w_data[2], w_data[3]
+                    for i in range(len(titles)):
+                        results.append({
+                            "title": titles[i],
+                            "url": urls[i],
+                            "snippet": snips[i] if i < len(snips) else "",
+                            "domain": "en.wikipedia.org"
+                        })
+        except Exception:
+            pass
+
+    return results
 
 
 def load_workbenches():
