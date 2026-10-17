@@ -21,6 +21,7 @@ CONFIG_PATHS = [
 
 def load_rules():
     tier1_rules = []
+    tier2_rules = []
     tier3_rules = []
     for path in CONFIG_PATHS:
         if not path.exists():
@@ -33,15 +34,19 @@ def load_rules():
                     continue
                 if line == "[TIER1_ONLY]":
                     active_section = "TIER1"
+                elif line == "[TIER2_ONLY]":
+                    active_section = "TIER2"
                 elif line == "[TIER3_ONLY]":
                     active_section = "TIER3"
                 elif active_section == "TIER1" and line not in tier1_rules:
                     tier1_rules.append(line)
+                elif active_section == "TIER2" and line not in tier2_rules:
+                    tier2_rules.append(line)
                 elif active_section == "TIER3" and line not in tier3_rules:
                     tier3_rules.append(line)
         except Exception:
             pass
-    return tier1_rules, tier3_rules
+    return tier1_rules, tier2_rules, tier3_rules
 
 
 def matches_rule(url: str, rules: list):
@@ -105,11 +110,36 @@ def probe_url(url: str, timeout: float = 2.5):
         return "TIER3", f"Probe error or timeout: {e}"
 
 
+def is_tier2_media(url: str):
+    p = urllib.parse.urlparse(url)
+    h = p.netloc.lower()
+    path = p.path.lower()
+    if "youtu.be" in h and len(path) > 1:
+        return "YouTube short link"
+    if "youtube.com" in h and path.startswith(("/watch", "/shorts/", "/live/", "/embed/")):
+        return "YouTube video/stream"
+    if "youtube.com" in h:
+        return "YouTube portal / search"
+    if any(v in h for v in ("twitch.tv", "vimeo.com", "odysee.com", "bilibili.com")) and len(path.strip("/")) > 0:
+        return f"Stream media host: {h}"
+    if path.endswith((".mp4", ".webm", ".mkv", ".m3u8")):
+        return "Direct video media file"
+    return None
+
+
 def classify_tier(url: str, probe: bool = True):
     if not re.match(r"^https?://", url):
         url = "https://" + url
 
-    t1_rules, t3_rules = load_rules()
+    t1_rules, t2_rules, t3_rules = load_rules()
+
+    r2 = matches_rule(url, t2_rules)
+    if r2:
+        return "TIER2", f"Matched [TIER2_ONLY] rule: {r2}"
+
+    media_reason = is_tier2_media(url)
+    if media_reason:
+        return "TIER2", f"Matched media pattern: {media_reason}"
 
     r1 = matches_rule(url, t1_rules)
     if r1:

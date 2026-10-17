@@ -46,6 +46,7 @@ except Exception:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from lib.vault import WebflowVault
+from lib.shield import apply_shield_and_ram_diet
 
 
 def extract_root_domain(url: str) -> str:
@@ -193,8 +194,9 @@ class WebflowViewer(Gtk.Window):
         settings.set_enable_developer_extras(False)
         settings.set_enable_smooth_scrolling(True)
         settings.set_javascript_can_open_windows_automatically(False)
-        if hasattr(settings, "set_enable_back_forward_navigation_gestures"):
-            settings.set_enable_back_forward_navigation_gestures(True)
+
+        # Apply native C++ bytecode adblock, tracker shield, and RAM diet
+        apply_shield_and_ram_diet(web_context, data_manager, self.ucm, settings, self.base_share)
 
         self.find_controller = self.web_view.get_find_controller()
 
@@ -218,7 +220,36 @@ class WebflowViewer(Gtk.Window):
             self.web_view.load_uri(req.get_uri())
         return None
 
+    def is_video_stream_url(self, url: str) -> bool:
+        if not url:
+            return False
+        p = urllib.parse.urlparse(url)
+        h = p.netloc.lower()
+        path = p.path.lower()
+        if "youtu.be" in h and len(path) > 1:
+            return True
+        if "youtube.com" in h and path.startswith(("/watch", "/shorts/", "/live/", "/embed/")):
+            return True
+        if any(v in h for v in ("twitch.tv", "vimeo.com", "odysee.com", "bilibili.com")) and len(path.strip("/")) > 0:
+            return True
+        if path.endswith((".mp4", ".webm", ".mkv", ".m3u8")):
+            return True
+        return False
+
     def on_decide_policy(self, web_view, decision, decision_type):
+        if decision_type in (WebKit.PolicyDecisionType.NAVIGATION_ACTION, WebKit.PolicyDecisionType.NEW_WINDOW_ACTION):
+            nav_action = decision.get_navigation_action()
+            req = nav_action.get_request()
+            uri = req.get_uri() if req else ""
+            if self.is_video_stream_url(uri):
+                wf_media = REPO_ROOT / "bin" / "wf-media"
+                subprocess.Popen([str(wf_media), uri], start_new_session=True)
+                self.set_status_notification("🎬 Handed video to wf-media (mpv)")
+                decision.ignore()
+                if uri == self.initial_url or not self.web_view.get_uri():
+                    GLib.idle_add(self.on_quit)
+                return True
+
         if decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
             nav_action = decision.get_navigation_action()
             req = nav_action.get_request()
@@ -487,6 +518,12 @@ class WebflowViewer(Gtk.Window):
         elif keyname == "P":
             self.eval_js("if (window.__wf_capture_credentials) window.__wf_capture_credentials();")
             return True
+        elif keyname in ("M", "m"):
+            uri = self.web_view.get_uri() or self.initial_url
+            wf_media = REPO_ROOT / "bin" / "wf-media"
+            subprocess.Popen([str(wf_media), uri], start_new_session=True)
+            self.set_status_notification("🎬 Launched in wf-media (mpv)")
+            return True
 
         self.pending_g = False
         return False
@@ -543,7 +580,21 @@ class WebflowViewer(Gtk.Window):
         except Exception:
             pass
 
+    def purge_non_essential_data(self):
+        try:
+            dm = self.web_view.get_context().get_website_data_manager()
+            purge_types = (
+                WebKit.WebsiteDataTypes.DISK_CACHE |
+                WebKit.WebsiteDataTypes.MEMORY_CACHE |
+                WebKit.WebsiteDataTypes.OFFLINE_APPLICATION_CACHE |
+                WebKit.WebsiteDataTypes.SERVICE_WORKER_REGISTRATIONS
+            )
+            dm.clear(purge_types, 0, None, None, None)
+        except Exception:
+            pass
+
     def on_quit(self, *args):
+        self.purge_non_essential_data()
         self.sync_workbench_on_exit()
         Gtk.main_quit()
         sys.exit(0)

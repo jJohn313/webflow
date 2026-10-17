@@ -9,6 +9,7 @@ import sys
 import re
 import time
 import json
+import shutil
 import subprocess
 import urllib.parse
 import urllib.request
@@ -23,6 +24,7 @@ def load_rules():
         Path.home() / ".config" / "webflow" / "rules.conf"
     ]
     tier1_rules = []
+    tier2_rules = []
     tier3_rules = []
     for path in config_paths:
         if path.exists():
@@ -35,16 +37,21 @@ def load_rules():
                     if line == "[TIER1_ONLY]":
                         active_section = "TIER1"
                         continue
+                    elif line == "[TIER2_ONLY]":
+                        active_section = "TIER2"
+                        continue
                     elif line == "[TIER3_ONLY]":
                         active_section = "TIER3"
                         continue
                     if active_section == "TIER1" and line not in tier1_rules:
                         tier1_rules.append(line)
+                    elif active_section == "TIER2" and line not in tier2_rules:
+                        tier2_rules.append(line)
                     elif active_section == "TIER3" and line not in tier3_rules:
                         tier3_rules.append(line)
             except Exception as e:
                 sys.stderr.write(f"Warning reading config {path}: {e}\n")
-    return tier1_rules, tier3_rules
+    return tier1_rules, tier2_rules, tier3_rules
 
 
 def matches_rule(url: str, rules: list) -> bool:
@@ -140,6 +147,23 @@ def log_history(tier: str, url: str, title: str = ""):
         f.write(json.dumps(entry) + "\n")
 
 
+def is_tier2_media(url: str) -> bool:
+    p = urllib.parse.urlparse(url)
+    h = p.netloc.lower()
+    path = p.path.lower()
+    if "youtu.be" in h and len(path) > 1:
+        return True
+    if "youtube.com" in h and path.startswith(("/watch", "/shorts/", "/live/", "/embed/")):
+        return True
+    if "youtube.com" in h and (shutil.which("youtube-tui") or shutil.which("ytfzf")):
+        return True
+    if any(v in h for v in ("twitch.tv", "vimeo.com", "odysee.com", "bilibili.com")) and len(path.strip("/")) > 0:
+        return True
+    if path.endswith((".mp4", ".webm", ".mkv", ".m3u8")):
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Webflow Dispatcher")
     parser.add_argument("url", help="Target URL")
@@ -152,7 +176,15 @@ def main():
     else:
         url = raw_url
 
-    tier1_rules, tier3_rules = load_rules()
+    bin_dir = Path(__file__).resolve().parent
+    tier1_rules, tier2_rules, tier3_rules = load_rules()
+
+    # Route video and media streams directly to Tier 2 (wf-media)
+    if (matches_rule(url, tier2_rules) or is_tier2_media(url)) and not args.workbench:
+        log_history("TIER2", url)
+        media_bin = bin_dir / "wf-media"
+        subprocess.Popen([str(media_bin), url], start_new_session=True)
+        return
 
     if matches_rule(url, tier1_rules):
         chosen_tier = "TIER1"
@@ -163,7 +195,6 @@ def main():
 
     log_history(chosen_tier, url)
 
-    bin_dir = Path(__file__).resolve().parent
     if chosen_tier == "TIER1" and not args.workbench:
         reader_bin = bin_dir / "wf-reader"
         os.execv(str(reader_bin), [str(reader_bin), url])

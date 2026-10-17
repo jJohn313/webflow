@@ -34,7 +34,7 @@ def load_routing_rules():
         BIN_DIR.parent / "config" / "rules.conf",
         Path.home() / ".config" / "webflow" / "rules.conf"
     ]
-    t1, t3 = [], []
+    t1, t2, t3 = [], [], []
     for path in config_paths:
         if path.exists():
             sec = None
@@ -46,24 +46,49 @@ def load_routing_rules():
                     if line == "[TIER1_ONLY]":
                         sec = "T1"
                         continue
+                    elif line == "[TIER2_ONLY]":
+                        sec = "T2"
+                        continue
                     elif line == "[TIER3_ONLY]":
                         sec = "T3"
                         continue
                     if sec == "T1" and line not in t1:
                         t1.append(line)
+                    elif sec == "T2" and line not in t2:
+                        t2.append(line)
                     elif sec == "T3" and line not in t3:
                         t3.append(line)
             except Exception:
                 pass
-    return t1, t3
+    return t1, t2, t3
 
 
-TIER1_RULES, TIER3_RULES = load_routing_rules()
+TIER1_RULES, TIER2_RULES, TIER3_RULES = load_routing_rules()
+
+
+def is_media_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if "youtu.be" in host and len(path) > 1:
+        return True
+    if "youtube.com" in host:
+        return True
+    if any(h in host for h in ("twitch.tv", "vimeo.com", "odysee.com", "bilibili.com")):
+        return True
+    if path.endswith((".mp4", ".webm", ".mkv", ".m3u8")):
+        return True
+    return False
 
 
 def predict_tier(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     target = f"{parsed.netloc}{parsed.path}"
+    for r in TIER2_RULES:
+        if r in target or re.search(r, target, re.IGNORECASE):
+            return "TIER2 (Media/mpv)"
+    if is_media_url(url):
+        return "TIER2 (Media/mpv)"
     for r in TIER1_RULES:
         if r in target or re.search(r, target, re.IGNORECASE):
             return "TIER1 (Rule)"
@@ -463,7 +488,16 @@ class WebflowTUI:
             url = item.get("url", "")
             domain = item.get("domain", "")
             snippet = item.get("snippet", "")
-            tier_badge = "[T1]" if "TIER1" in predict_tier(url) else "[T3]"
+            pred = predict_tier(url)
+            if "TIER2" in pred:
+                tier_badge = "[T2]"
+                t_color = curses.color_pair(6) | curses.A_BOLD
+            elif "TIER1" in pred:
+                tier_badge = "[T1]"
+                t_color = curses.color_pair(2) | curses.A_BOLD
+            else:
+                tier_badge = "[T3]"
+                t_color = curses.color_pair(3) | curses.A_BOLD
 
             line1 = f" {real_idx + 1:2d}. {item.get('title', '')}"
             badge_str = f" {tier_badge} "
@@ -476,7 +510,6 @@ class WebflowTUI:
                 self.safe_addstr(y1, px + 1, line1_fmt[:pw - 2].ljust(pw - 2), curses.color_pair(5) | curses.A_BOLD)
                 self.safe_addstr(y2, px + 1, sub_text[:pw - 2].ljust(pw - 2), curses.color_pair(5))
             else:
-                t_color = curses.color_pair(2) if tier_badge == "[T1]" else curses.color_pair(3)
                 self.safe_addstr(y1, px + 1, line1[:max_t], curses.color_pair(7) | curses.A_BOLD)
                 self.safe_addstr(y1, px + 1 + max_t, badge_str, t_color)
                 self.safe_addstr(y2, px + 1, sub_text[:pw - 3], curses.color_pair(1) | curses.A_DIM)
@@ -633,7 +666,7 @@ class WebflowTUI:
             self.safe_addstr(py + 3, px + 3, "Select an item to preview details.", curses.color_pair(7))
 
         self.safe_addstr(py + ph - 3, px + 2, "─" * (pw - 4), curses.color_pair(7))
-        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [w] Bench | [P] Vault", curses.color_pair(1))
+        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [m] Media | [w] Bench | [P] Vault", curses.color_pair(1))
 
     def draw_workbench_picker_modal(self, h, w):
         options = [b.get("name") for b in self.workbenches] + ["➕ Create New Workbench..."]
@@ -752,6 +785,8 @@ class WebflowTUI:
             self.execute_selection(force_tier="TIER3")
         elif key in [ord('r'), ord('R')]:
             self.execute_selection(force_tier="TIER1")
+        elif key in [ord('m'), ord('M')]:
+            self.execute_selection(force_tier="TIER2")
         elif key in [ord('w'), ord('W')]:
             self.open_workbench_picker()
         elif key in [ord('b'), ord('B')]:
@@ -881,6 +916,9 @@ class WebflowTUI:
         if url:
             if force_tier == "TIER1":
                 self.launch_external([str(wf_reader), url], wait=True)
+            elif force_tier == "TIER2" or (not force_tier and "TIER2" in predict_tier(url)):
+                wf_media = BIN_DIR / "wf-media"
+                self.launch_external([str(wf_media), url], wait=False)
             elif force_tier == "TIER3":
                 self.launch_external([str(wf_view), url], wait=False)
             else:
