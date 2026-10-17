@@ -162,15 +162,39 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
     temp_md.write(header + md_text)
     temp_md.close()
 
+    # Detect available pagers on system
+    has_glow = subprocess.run(["which", "glow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    has_less = subprocess.run(["which", "less"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    has_bat = subprocess.run(["which", "bat"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    has_more = subprocess.run(["which", "more"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
     try:
-        # Check glow or less
-        has_glow = subprocess.run(["which", "glow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         if has_glow:
-            subprocess.run(["glow", "-p", temp_md.name])
-        else:
+            env = os.environ.copy()
+            if not has_less:
+                if has_bat:
+                    env["PAGER"] = "bat --style=plain"
+                elif has_more:
+                    env["PAGER"] = "more"
+            res = subprocess.run(["glow", "-p", temp_md.name], env=env)
+            if res.returncode != 0:
+                if has_bat:
+                    subprocess.run(["bat", "--style=plain", temp_md.name])
+                elif has_more:
+                    subprocess.run(["more", temp_md.name])
+        elif has_bat:
+            subprocess.run(["bat", "--style=plain", temp_md.name])
+        elif has_less:
             subprocess.run(["less", "-R", temp_md.name])
+        elif has_more:
+            subprocess.run(["more", temp_md.name])
+        else:
+            subprocess.run(["cat", temp_md.name])
     finally:
-        pass
+        try:
+            os.remove(temp_md.name)
+        except OSError:
+            pass
 
     # Post-read modal action prompt
     print("\n" + "=" * 60)
