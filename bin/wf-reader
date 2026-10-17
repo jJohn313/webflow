@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-wf-reader - Tier 1: Terminal Markdown Extractor & Terminal Runner for Webflow
-Extracts semantic text from web pages into clean Markdown and renders inside a terminal reader.
+wf-reader - Tier 1: Terminal Markdown Extractor & Typeset Terminal Reader for Webflow
+Extracts semantic text from web pages into clean Markdown and renders formatted ANSI typography.
 """
-
 import os
 import sys
 import re
 import html
+import shutil
+import textwrap
 import tempfile
 import urllib.request
 import urllib.parse
@@ -23,14 +24,12 @@ class SemanticHTMLToMarkdown(HTMLParser):
         self.output = []
         self.title = ""
         self.in_title = False
-        self.links = []
-        self.link_counter = 0
-
+        self.in_pre = False
         self.ignored_tags = {
             "script", "style", "nav", "footer", "header", "aside",
-            "noscript", "iframe", "svg", "button", "form"
+            "noscript", "iframe", "svg", "button", "form", "figure", "figcaption"
         }
-        self.ignore_depth = 0
+        self.ignore_stack = []
         self.current_href = None
         self.current_link_text = []
 
@@ -38,17 +37,23 @@ class SemanticHTMLToMarkdown(HTMLParser):
         attrs_dict = dict(attrs)
         tag_lower = tag.lower()
 
+        if self.ignore_stack:
+            self.ignore_stack.append(tag_lower)
+            return
+
         if tag_lower in self.ignored_tags:
-            self.ignore_depth += 1
+            self.ignore_stack.append(tag_lower)
             return
 
-        # Filter out obvious ad / navigation containers by class or id
-        class_id = (attrs_dict.get("class", "") + " " + attrs_dict.get("id", "")).lower()
-        if any(ad in class_id for ad in ["advert", "sidebar", "cookie-banner", "consent", "footer-nav"]):
-            self.ignore_depth += 1
-            return
-
-        if self.ignore_depth > 0:
+        class_id = (attrs_dict.get("class", "") + " " + attrs_dict.get("id", "") + " " + attrs_dict.get("role", "")).lower()
+        noise_tokens = [
+            "advert", "sidebar", "cookie", "consent", "footer", "nav", "menu",
+            "mw-editsection", "reflist", "reference", "infobox", "catlinks",
+            "toc", "vector-header", "vector-page-toolbar", "vector-column-start",
+            "mw-jump-link", "printfooter", "noprint", "ambox", "hatnote"
+        ]
+        if any(tok in class_id for tok in noise_tokens):
+            self.ignore_stack.append(tag_lower)
             return
 
         if tag_lower == "title":
@@ -58,60 +63,63 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.output.append(f"\n\n{'#' * level} ")
         elif tag_lower == "p":
             self.output.append("\n\n")
+        elif tag_lower == "blockquote":
+            self.output.append("\n\n> ")
         elif tag_lower == "br":
             self.output.append("\n")
         elif tag_lower == "li":
             self.output.append("\n* ")
         elif tag_lower in ["strong", "b"]:
-            self.output.append("**")
+            self.output.append(" **")
         elif tag_lower in ["em", "i"]:
-            self.output.append("*")
-        elif tag_lower == "code":
-            self.output.append("`")
+            self.output.append(" *")
+        elif tag_lower == "code" and not self.in_pre:
+            self.output.append(" `")
         elif tag_lower == "pre":
+            self.in_pre = True
             self.output.append("\n\n```\n")
         elif tag_lower == "a":
-            href = attrs_dict.get("href")
-            if href:
-                full_url = urllib.parse.urljoin(self.base_url, href)
-                self.current_href = full_url
+            href = attrs_dict.get("href", "")
+            if href and not href.startswith(("#", "javascript:", "mailto:")):
+                self.current_href = urllib.parse.urljoin(self.base_url, href)
                 self.current_link_text = []
 
     def handle_endtag(self, tag):
         tag_lower = tag.lower()
-        if tag_lower in self.ignored_tags:
-            if self.ignore_depth > 0:
-                self.ignore_depth -= 1
-            return
-
-        if self.ignore_depth > 0:
+        if self.ignore_stack:
+            self.ignore_stack.pop()
             return
 
         if tag_lower == "title":
             self.in_title = False
         elif tag_lower in ["strong", "b"]:
-            self.output.append("**")
+            self.output.append("** ")
         elif tag_lower in ["em", "i"]:
-            self.output.append("*")
-        elif tag_lower == "code":
-            self.output.append("`")
+            self.output.append("* ")
+        elif tag_lower == "code" and not self.in_pre:
+            self.output.append("` ")
         elif tag_lower == "pre":
-            self.output.append("\n```\n")
+            self.in_pre = False
+            self.output.append("\n```\n\n")
         elif tag_lower == "a" and self.current_href:
-            link_text = "".join(self.current_link_text).strip()
-            if link_text:
-                self.link_counter += 1
-                self.links.append((self.link_counter, link_text, self.current_href))
-                self.output.append(f"[{link_text}]({self.current_href}) `[{self.link_counter}]`")
+            link_text = " ".join("".join(self.current_link_text).split()).strip()
+            # Ignore "[edit]" or numeric footnote markers like "[1]"
+            if link_text and not re.match(r"^\[?\d+\]?$", link_text) and link_text.lower() != "edit":
+                self.output.append(f" [{link_text}]({self.current_href}) ")
+            elif link_text:
+                self.output.append(f" {link_text} ")
             self.current_href = None
             self.current_link_text = []
 
     def handle_data(self, data):
-        if self.ignore_depth > 0:
+        if self.ignore_stack:
             return
         if self.in_title:
             self.title += data
             return
+        if not self.in_pre:
+            # Collapse internal HTML newlines/tabs into single spaces
+            data = re.sub(r"\s+", " ", data)
         if self.current_href is not None:
             self.current_link_text.append(data)
         else:
@@ -119,12 +127,17 @@ class SemanticHTMLToMarkdown(HTMLParser):
 
     def get_markdown(self):
         text = "".join(self.output)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text, self.title.strip(), self.links
+        return text, self.title.strip()
 
 
-def postprocess_markdown_links(md_text: str, base_url: str):
-    """Ensures all Markdown links are indexed with [1..N] for interactive jumping."""
+def format_links_for_reading(md_text: str, base_url: str):
+    """
+    Replaces inline [Text](https://long-url) with clean readable 'Text [N]'
+    so raw URLs never clutter the prose, while storing (N, Text, URL) for navigation.
+    """
     links = []
     counter = 0
 
@@ -132,136 +145,242 @@ def postprocess_markdown_links(md_text: str, base_url: str):
         nonlocal counter
         text = match.group(1).strip()
         href = match.group(2).strip()
-        if not text or href.startswith("#") or href.startswith("javascript:"):
-            return match.group(0)
+        if not text or href.startswith(("#", "javascript:")):
+            return text
+        if re.match(r"^\[?\d+\]?$", text) or text.lower() == "edit":
+            return ""
         full_url = urllib.parse.urljoin(base_url, href)
         counter += 1
         links.append((counter, text, full_url))
-        return f"[{text}]({full_url}) `[{counter}]`"
+        return f"**{text}** `[{counter}]`"
 
-    # Avoid duplicate index tags
-    cleaned = re.sub(r' `\[\d+\]`', '', md_text)
-    processed = re.sub(r'\[([^\[\]]+)\]\(([^)\s]+)\)', repl, cleaned)
+    cleaned = re.sub(r" `\[\d+\]`", "", md_text)
+    processed = re.sub(r"\[([^\[\]]+)\]\(([^)\s]+)\)", repl, cleaned)
     return processed, links
+
+
+def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> str:
+    """
+    Typesets clean Markdown into a padded, word-wrapped ANSI terminal layout.
+    """
+    term_w = shutil.get_terminal_size((100, 30)).columns
+    width = min(88, max(60, term_w - 8))
+    pad = "    "
+
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    MAGENTA = "\033[35m"
+
+    def style_inline(line: str) -> str:
+        # Reference numbers `[12]` -> yellow dim
+        line = re.sub(r"`\[(\d+)\]`", f"{YELLOW}[\\1]{RESET}", line)
+        # Inline code `code` -> magenta
+        line = re.sub(r"`([^`]+)`", f"{MAGENTA}\\1{RESET}", line)
+        # Bold **text** -> cyan bold (links & emphasis)
+        line = re.sub(r"\*\*([^*]+)\*\*", f"{BOLD}{CYAN}\\1{RESET}", line)
+        # Italic *text*
+        line = re.sub(r"\*([^*]+)\*", f"{ITALIC}\\1{RESET}", line)
+        return line
+
+    out = []
+    out.append("")
+    out.append(f"{pad}{BOLD}{CYAN}┏{'━' * (width - 2)}┓{RESET}")
+    for t_line in textwrap.wrap(title, width=width - 6):
+        out.append(f"{pad}{BOLD}{CYAN}┃{RESET}  {BOLD}{t_line.ljust(width - 6)}{RESET}  {BOLD}{CYAN}┃{RESET}")
+    out.append(f"{pad}{BOLD}{CYAN}┗{'━' * (width - 2)}┛{RESET}")
+    out.append(f"{pad}{DIM}Source: {url}{RESET}")
+    out.append(f"{pad}{DIM}{'─' * width}{RESET}\n")
+
+    in_code = False
+    paragraphs = md_text.split("\n\n")
+
+    for block in paragraphs:
+        block = block.strip()
+        if not block:
+            continue
+
+        if block.startswith("```"):
+            lines = block.splitlines()
+            out.append(f"{pad}{DIM}┌── code {'─' * (width - 10)}┐{RESET}")
+            for cl in lines[1:]:
+                if cl.strip() == "```":
+                    continue
+                out.append(f"{pad}{DIM}│{RESET} {MAGENTA}{cl}{RESET}")
+            out.append(f"{pad}{DIM}└{'─' * (width - 2)}┘{RESET}\n")
+            continue
+
+        # Headings
+        if block.startswith("#"):
+            m = re.match(r"^(#+)\s*(.*)", block)
+            if m:
+                level = len(m.group(1))
+                h_text = re.sub(r"\*\*([^*]+)\*\*", r"\1", m.group(2))
+                h_text = re.sub(r"`\[\d+\]`", "", h_text).strip()
+                if level == 1:
+                    out.append(f"\n{pad}{BOLD}{GREEN}██ {h_text.upper()}{RESET}")
+                    out.append(f"{pad}{GREEN}{'═' * min(len(h_text) + 3, width)}{RESET}\n")
+                elif level == 2:
+                    out.append(f"\n{pad}{BOLD}{CYAN}▌ {h_text}{RESET}")
+                    out.append(f"{pad}{DIM}{'─' * min(len(h_text) + 2, width)}{RESET}\n")
+                else:
+                    out.append(f"\n{pad}{BOLD}{YELLOW}• {h_text}{RESET}\n")
+                continue
+
+        # Bullet lists
+        if block.startswith("* ") or block.startswith("- "):
+            for item in block.splitlines():
+                item_clean = re.sub(r"^[\*\-]\s+", "", item.strip())
+                wrapped = textwrap.wrap(item_clean, width=width - 4)
+                for idx, wline in enumerate(wrapped):
+                    prefix = f"{pad}  {CYAN}•{RESET} " if idx == 0 else f"{pad}    "
+                    out.append(prefix + style_inline(wline))
+            out.append("")
+            continue
+
+        # Blockquotes
+        if block.startswith(">"):
+            q_clean = re.sub(r"^>\s*", "", block, flags=re.MULTILINE)
+            for wline in textwrap.wrap(q_clean, width=width - 4):
+                out.append(f"{pad}{YELLOW}│{RESET} {ITALIC}{style_inline(wline)}{RESET}")
+            out.append("")
+            continue
+
+        # Standard prose paragraph
+        wrapped = textwrap.wrap(block, width=width)
+        for wline in wrapped:
+            out.append(f"{pad}{style_inline(wline)}")
+        out.append("")
+
+    if links:
+        out.append(f"\n{pad}{BOLD}{CYAN}▌ Hyperlink Reference Index (Type 1..{len(links)} after reading){RESET}")
+        out.append(f"{pad}{DIM}{'─' * width}{RESET}")
+        for num, ltext, lurl in links[:60]:
+            short_t = (ltext[:32] + "…") if len(ltext) > 33 else ltext
+            short_u = (lurl[:width - 42] + "…") if len(lurl) > (width - 41) else lurl
+            out.append(f"{pad}{YELLOW}[{num:2d}]{RESET} {BOLD}{short_t:<34}{RESET} {DIM}{short_u}{RESET}")
+        if len(links) > 60:
+            out.append(f"{pad}{DIM}... and {len(links) - 60} more links.{RESET}")
+        out.append("")
+
+    return "\n".join(out)
 
 
 def extract_content(url: str):
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Webflow/0.1.0"
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw_html = resp.read().decode("utf-8", errors="replace")
 
-    # Optional trafilatura integration if installed
+    # 1. Try trafilatura first if available
     try:
         import trafilatura
-        extracted = trafilatura.extract(raw_html, include_links=True, output_format="markdown")
+        extracted = trafilatura.extract(
+            raw_html,
+            include_links=True,
+            include_tables=False,
+            output_format="markdown"
+        )
         if extracted and len(extracted) > 300:
             meta = trafilatura.extract_metadata(raw_html)
             title = (meta.title if meta and meta.title else None) or url
-            md_indexed, links = postprocess_markdown_links(extracted, url)
-            return md_indexed, title, links
+            md_clean, links = format_links_for_reading(extracted, url)
+            return md_clean, title, links
     except ImportError:
         pass
 
-    # Built-in semantic extractor
+    # 2. Scope to <article>, <main>, or #mw-content-text if present to avoid site chrome
+    body_html = raw_html
+    for pattern in [
+        r'<div[^>]+id=["\']mw-content-text["\'][^>]*>(.*?)<div class=["\']printfooter["\']',
+        r'<article[^>]*>(.*?)</article>',
+        r'<main[^>]*>(.*?)</main>'
+    ]:
+        m = re.search(pattern, raw_html, re.DOTALL | re.IGNORECASE)
+        if m and len(m.group(1)) > 500:
+            body_html = m.group(1)
+            break
+
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.DOTALL | re.IGNORECASE)
+    doc_title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1)).strip()) if title_m else url
+
     parser = SemanticHTMLToMarkdown(base_url=url)
-    parser.feed(raw_html)
-    raw_md, title, links = parser.get_markdown()
-    md_indexed, links = postprocess_markdown_links(raw_md, url)
-    return md_indexed, title, links
+    parser.feed(body_html)
+    raw_md, parsed_title = parser.get_markdown()
+    final_title = parsed_title or doc_title
+    md_clean, links = format_links_for_reading(raw_md, url)
+    return md_clean, final_title, links
 
 
 def bookmark(url: str, title: str):
     bm_file = Path.home() / ".local" / "share" / "webflow" / "bookmarks.txt"
     bm_file.parent.mkdir(parents=True, exist_ok=True)
     with open(bm_file, "a", encoding="utf-8") as f:
-        f.write(f"{url} | {title}\n")
-    print(f"\n[✔] Bookmarked: {url} | {title}")
+        f.write(f"{url} | {title} | general\n")
+    print(f"\n[+] Bookmarked: {url} | {title}")
 
 
 def run_interactive_reader(url: str, title: str, md_text: str, links: list):
-    # Write temporary file
-    temp_md = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8")
-    header = f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n"
-    temp_md.write(header + md_text)
-    temp_md.close()
+    ansi_doc = render_markdown_to_ansi(title, url, md_text, links)
 
-    # Detect available pagers on system
-    has_glow = subprocess.run(["which", "glow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    has_less = subprocess.run(["which", "less"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    has_bat = subprocess.run(["which", "bat"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    has_more = subprocess.run(["which", "more"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    # Display in interactive pager with ANSI colors enabled
+    if shutil.which("less"):
+        proc = subprocess.Popen(
+            ["less", "-R", "-f", "-Q", "-P", f" Webflow Reader: {title[:40]} (j/k scroll, q actions) "],
+            stdin=subprocess.PIPE
+        )
+        proc.communicate(input=ansi_doc.encode("utf-8"))
+    elif shutil.which("bat"):
+        proc = subprocess.Popen(["bat", "--style=plain", "--paging=always"], stdin=subprocess.PIPE)
+        proc.communicate(input=ansi_doc.encode("utf-8"))
+    else:
+        print(ansi_doc)
 
-    try:
-        if has_glow:
-            env = os.environ.copy()
-            if not has_less:
-                if has_bat:
-                    env["PAGER"] = "bat --style=plain"
-                elif has_more:
-                    env["PAGER"] = "more"
-            res = subprocess.run(["glow", "-p", temp_md.name], env=env)
-            if res.returncode != 0:
-                if has_bat:
-                    subprocess.run(["bat", "--style=plain", temp_md.name])
-                elif has_more:
-                    subprocess.run(["more", temp_md.name])
-        elif has_bat:
-            subprocess.run(["bat", "--style=plain", temp_md.name])
-        elif has_less:
-            subprocess.run(["less", "-R", temp_md.name])
-        elif has_more:
-            subprocess.run(["more", temp_md.name])
-        else:
-            subprocess.run(["cat", temp_md.name])
-    finally:
+    # Action loop after exiting pager
+    while True:
+        print("\033[36m" + "─" * 64 + "\033[0m")
+        print(f"  \033[1m{title}\033[0m")
+        print("  \033[33m[1..N]\033[0m Follow Link #   \033[33m[E]\033[0m Escalate to GUI (wf-view)   \033[33m[r]\033[0m Re-read")
+        print("  \033[33m[b]\033[0m    Bookmark        \033[33m[s]\033[0m Save Markdown           \033[33m[q/Enter]\033[0m Quit")
+        print("\033[36m" + "─" * 64 + "\033[0m")
+
         try:
-            os.remove(temp_md.name)
-        except OSError:
-            pass
+            choice = input("wf-reader > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
 
-    # Post-read modal action prompt
-    print("\n" + "=" * 60)
-    print(f"📖 Webflow Reader: {title}")
-    print("=" * 60)
-    print("Actions:")
-    print("  [E]       Escalate to GUI viewer (wf-view)")
-    print("  [b]       Bookmark page")
-    print("  [s]       Save clean Markdown to disk")
-    print("  [1..N]    Open referenced link number in wf-open")
-    print("  [q/Enter] Quit reader")
-    print("-" * 60)
-
-    try:
-        choice = input("wf-reader > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        choice = "q"
-
-    if choice.lower() == "e":
-        wf_view_bin = Path(__file__).resolve().parent / "wf-view"
-        os.execv(str(wf_view_bin), [str(wf_view_bin), url])
-    elif choice.lower() == "b":
-        bookmark(url, title)
-    elif choice.lower() == "s":
-        save_dir = Path.home() / "Documents" / "Webflow"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
-        target_file = save_dir / f"{safe_title}.md"
-        target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
-        print(f"[✔] Article saved to: {target_file}")
-    elif choice.isdigit():
-        num = int(choice)
-        match = [l for l in links if l[0] == num]
-        if match:
-            target_link = match[0][2]
-            wf_open_bin = Path(__file__).resolve().parent / "wf-open"
-            os.execv(str(wf_open_bin), [str(wf_open_bin), target_link])
-        else:
-            print("Invalid link reference number.")
-    elif choice.lower() == "q" or not choice:
-        pass
+        if not choice or choice.lower() == "q":
+            break
+        elif choice.lower() == "r":
+            return run_interactive_reader(url, title, md_text, links)
+        elif choice.lower() == "e":
+            wf_view_bin = Path(__file__).resolve().parent / "wf-view"
+            subprocess.Popen([str(wf_view_bin), url], start_new_session=True)
+            break
+        elif choice.lower() == "b":
+            bookmark(url, title)
+        elif choice.lower() == "s":
+            save_dir = Path.home() / "Documents" / "Webflow"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
+            target_file = save_dir / f"{safe_title}.md"
+            target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
+            print(f"[+] Saved to: {target_file}")
+        elif choice.isdigit():
+            num = int(choice)
+            match = [l for l in links if l[0] == num]
+            if match:
+                target_link = match[0][2]
+                wf_open_bin = Path(__file__).resolve().parent / "wf-open"
+                os.execv(str(wf_open_bin), [str(wf_open_bin), target_link])
+            else:
+                print(f"[-] Link [{num}] not found (valid range: 1..{len(links)}).")
 
 
 def main():
@@ -273,7 +392,7 @@ def main():
     if not re.match(r"^https?://", url):
         url = "https://" + url
 
-    print(f"[*] Extracting article text from: {url}...")
+    print(f"[*] Extracting & typesetting: {url}...")
     try:
         md_text, title, links = extract_content(url)
         if not title:

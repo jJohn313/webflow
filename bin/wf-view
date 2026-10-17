@@ -7,22 +7,41 @@ import os
 import sys
 import json
 import time
+import traceback
 import argparse
 import urllib.parse
 import subprocess
 from pathlib import Path
 
+# Fix WebKitGTK DMA-BUF / EGL crash on Wayland (Hyprland + Nvidia/Mesa)
+os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "0")
 os.environ.setdefault("GDK_BACKEND", "wayland,x11")
+
+LOG_FILE = Path.home() / ".local" / "share" / "webflow" / "wf-view-error.log"
+
+def log_error(msg: str):
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+    sys.stderr.write(msg + "\n")
 
 import gi
 try:
     gi.require_version("WebKit2", "4.1")
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
-except ValueError as e:
-    sys.stderr.write(f"Error loading WebKit2GTK 4.1 / GTK 3.0: {e}\n")
-    sys.stderr.write("Ensure 'webkit2gtk-4.1' and 'python-gobject' are installed.\n")
-    sys.exit(1)
+except Exception:
+    try:
+        gi.require_version("WebKit2", "4.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
+    except Exception as e:
+        log_error(f"Error loading WebKit2GTK / GTK 3.0: {e}\nEnsure 'webkit2gtk-4.1' and 'python-gobject' are installed.")
+        sys.exit(1)
 
 
 def extract_root_domain(url: str) -> str:
@@ -32,7 +51,6 @@ def extract_root_domain(url: str) -> str:
         return "local"
     parts = netloc.split(".")
     if len(parts) >= 2:
-        # Handle two-part TLDs like co.uk, org.uk, com.au
         if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) == 2:
             return ".".join(parts[-3:])
         return ".".join(parts[-2:])
@@ -41,7 +59,7 @@ def extract_root_domain(url: str) -> str:
 
 class WebflowViewer(Gtk.Window):
     def __init__(self, initial_url: str, workbench: str = None):
-        super().__init__()
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.initial_url = initial_url if "://" in initial_url else f"https://{initial_url}"
         self.root_domain = extract_root_domain(self.initial_url)
         self.workbench = workbench
@@ -69,26 +87,32 @@ class WebflowViewer(Gtk.Window):
         self.load_url(self.initial_url)
 
     def setup_window(self):
-        self.set_wmclass("wf-view", "wf-view")
+        try:
+            Gdk.set_program_class("wf-view")
+        except Exception:
+            pass
         self.set_default_size(1280, 800)
         self.set_decorated(False)
         self.connect("destroy", self.on_quit)
 
     def setup_engine(self):
-        data_manager = WebKit.WebsiteDataManager(
-            base_data_directory=str(self.session_dir),
-            base_cache_directory=str(self.session_dir / "cache"),
-            local_storage_directory=str(self.session_dir / "localstorage"),
-            disk_cache_directory=str(self.session_dir / "diskcache")
-        )
-        cookie_manager = data_manager.get_cookie_manager()
+        # Safe WebsiteDataManager creation across WebKit2 4.0 / 4.1
+        try:
+            data_manager = WebKit.WebsiteDataManager(
+                base_data_directory=str(self.session_dir / "data"),
+                base_cache_directory=str(self.session_dir / "cache")
+            )
+            web_context = WebKit.WebContext.new_with_website_data_manager(data_manager)
+            cookie_manager = data_manager.get_cookie_manager()
+        except Exception:
+            web_context = WebKit.WebContext.get_default()
+            cookie_manager = web_context.get_cookie_manager()
+
         cookie_manager.set_persistent_storage(
             str(self.session_dir / "cookies.sqlite"),
             WebKit.CookiePersistentStorage.SQLITE
         )
         cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NO_THIRD_PARTY)
-
-        web_context = WebKit.WebContext.new_with_website_data_manager(data_manager)
 
         self.ucm = WebKit.UserContentManager()
         self.ucm.register_script_message_handler("webflow")
@@ -114,24 +138,24 @@ class WebflowViewer(Gtk.Window):
             }, true);
         })();
         """
-        user_script = WebKit.UserScript(
-            source=focus_observer_js,
-            injected_frames=WebKit.UserContentInjectedFrames.ALL_FRAMES,
-            injection_time=WebKit.UserScriptInjectionTime.END,
-            whitelist=[],
-            blacklist=[]
+        user_script = WebKit.UserScript.new(
+            focus_observer_js,
+            WebKit.UserContentInjectedFrames.ALL_FRAMES,
+            WebKit.UserScriptInjectionTime.END,
+            None,
+            None
         )
         self.ucm.add_script(user_script)
 
-        self.web_view = WebKit.WebView.new_with_context(web_context)
-        if hasattr(self.web_view, "set_user_content_manager"):
-            self.web_view.set_user_content_manager(self.ucm)
+        # Create WebView with both context and user_content_manager via GObject
+        self.web_view = GObject_new_webview(web_context, self.ucm)
 
         settings = self.web_view.get_settings()
         settings.set_enable_developer_extras(False)
         settings.set_enable_smooth_scrolling(True)
         settings.set_javascript_can_open_windows_automatically(False)
-        settings.set_enable_back_forward_navigation_gestures(True)
+        if hasattr(settings, "set_enable_back_forward_navigation_gestures"):
+            settings.set_enable_back_forward_navigation_gestures(True)
 
         self.find_controller = self.web_view.get_find_controller()
 
@@ -145,7 +169,6 @@ class WebflowViewer(Gtk.Window):
         self.update_title()
 
     def on_create_web_view(self, web_view, navigation_action):
-        # Redirect popups / target="_blank" into current view
         req = navigation_action.get_request()
         if req and req.get_uri():
             self.web_view.load_uri(req.get_uri())
@@ -171,7 +194,6 @@ class WebflowViewer(Gtk.Window):
         self.web_view.load_uri(url)
 
     def update_title(self):
-        # Always include (@domain) in title so wf-pass can reliably extract it via hyprctl
         page_title = self.web_view.get_title() or self.root_domain
         wb_tag = f" [WB:{self.workbench}]" if self.workbench else ""
         search_tag = f" [/{self.search_text}]" if self.mode == "SEARCH" else ""
@@ -189,7 +211,10 @@ class WebflowViewer(Gtk.Window):
 
     def on_js_message(self, manager, js_result):
         try:
-            val = js_result.get_value().to_string()
+            if hasattr(js_result, "get_js_value"):
+                val = js_result.get_js_value().to_string()
+            else:
+                val = js_result.get_value().to_string()
             data = json.loads(val) if val.startswith("{") else {"action": "set_mode", "mode": val}
             action = data.get("action")
             if action == "set_mode":
@@ -210,7 +235,6 @@ class WebflowViewer(Gtk.Window):
         if not keyname:
             return False
 
-        # Global Escape: always drop to NORMAL mode, clear search/hints, blur inputs
         if keyname == "Escape":
             self.mode = "NORMAL"
             self.pending_g = False
@@ -246,7 +270,6 @@ class WebflowViewer(Gtk.Window):
         if self.mode in ("INSERT", "HINTS"):
             return False
 
-        # NORMAL MODE KEYBINDINGS
         if keyname == "j":
             self.eval_js("window.scrollBy({top: 120, behavior: 'smooth'});")
             return True
@@ -306,7 +329,6 @@ class WebflowViewer(Gtk.Window):
             self.web_view.set_zoom_level(1.0)
             return True
         elif keyname == "E":
-            # Demote current page to wf-reader inside a new terminal or stdout
             uri = self.web_view.get_uri() or self.initial_url
             wf_reader = Path(__file__).resolve().parent / "wf-reader"
             subprocess.Popen(["kitty", "-e", str(wf_reader), uri])
@@ -341,7 +363,7 @@ class WebflowViewer(Gtk.Window):
             self.update_title()
             self.eval_js(hints_js)
         except Exception as e:
-            sys.stderr.write(f"Failed to inject hints: {e}\n")
+            log_error(f"Failed to inject hints: {e}")
 
     def bookmark_current(self):
         uri = self.web_view.get_uri() or self.initial_url
@@ -349,7 +371,6 @@ class WebflowViewer(Gtk.Window):
         self.bookmarks_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.bookmarks_file, "a", encoding="utf-8") as f:
             f.write(f"{uri} | {title} | general\n")
-        print(f"[wf-view] Bookmarked: {uri}")
 
     def copy_url_to_clipboard(self):
         uri = self.web_view.get_uri() or self.initial_url
@@ -391,14 +412,27 @@ class WebflowViewer(Gtk.Window):
         sys.exit(0)
 
 
+def GObject_new_webview(web_context, ucm):
+    from gi.repository import GObject
+    return GObject.new(
+        WebKit.WebView,
+        web_context=web_context,
+        user_content_manager=ucm
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Webflow Tier 3 WebKitGTK Viewer")
     parser.add_argument("url", help="Target URL")
     parser.add_argument("--workbench", "-w", default=None, help="Bind to named workbench session")
     args = parser.parse_args()
 
-    app = WebflowViewer(args.url.strip(), workbench=args.workbench)
-    Gtk.main()
+    try:
+        app = WebflowViewer(args.url.strip(), workbench=args.workbench)
+        Gtk.main()
+    except Exception:
+        log_error(traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == "__main__":

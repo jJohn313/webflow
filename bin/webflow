@@ -229,7 +229,7 @@ class WebflowTUI:
         self.search_query = ""
         self.search_results = []
         self.is_searching = False
-        self.status_msg = "NORMAL  |  / Search  |  w Add to Bench  |  Enter Open  |  q Quit"
+        self.status_msg = "NORMAL  |  / Search  |  Enter Open  |  v GUI  |  r Reader  |  w Bench  |  b Mark  |  q Quit"
 
         self.workbenches = load_workbenches()
         self.history = load_history()
@@ -490,7 +490,7 @@ class WebflowTUI:
 
         # Bottom Action Hints in Preview Box
         self.safe_addstr(py + ph - 3, px + 2, "─" * (pw - 4), curses.color_pair(7))
-        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [w] Add to Bench | [b] Mark", curses.color_pair(1))
+        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [r] Reader | [w] Bench | [b] Mark", curses.color_pair(1))
 
     def handle_input(self, key):
         # Searching text input
@@ -550,6 +550,14 @@ class WebflowTUI:
         elif key in [10, 13]:
             self.execute_selection()
 
+        # Force Tier 3 GUI (v)
+        elif key in [ord('v'), ord('V')]:
+            self.execute_selection(force_tier="TIER3")
+
+        # Force Tier 1 Reader (r)
+        elif key in [ord('r'), ord('R')]:
+            self.execute_selection(force_tier="TIER1")
+
         # Add to workbench (w)
         elif key in [ord('w'), ord('W')]:
             self.prompt_add_to_workbench()
@@ -570,40 +578,51 @@ class WebflowTUI:
             return len(self.bookmarks)
         return 0
 
-    def execute_selection(self):
+    def launch_external(self, cmd_list, wait=True):
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            if wait:
+                subprocess.run(cmd_list)
+            else:
+                subprocess.Popen(
+                    cmd_list,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+        finally:
+            curses.reset_prog_mode()
+            self.stdscr.clear()
+            self.stdscr.refresh()
+            self.history = load_history()
+            self.bookmarks = load_bookmarks()
+            self.workbenches = load_workbenches()
+
+    def execute_selection(self, force_tier=None):
         sec = self.nav_items[self.nav_idx][1]
         wf_open = BIN_DIR / "wf-open"
+        wf_view = BIN_DIR / "wf-view"
+        wf_reader = BIN_DIR / "wf-reader"
 
-        if sec == "search" and self.search_results and self.list_idx < len(self.search_results):
-            url = self.search_results[self.list_idx].get("url")
-            if url:
-                curses.endwin()
-                subprocess.run([str(wf_open), url])
-                self.stdscr.refresh()
-
-        elif sec == "workbenches" and self.workbenches and self.list_idx < len(self.workbenches):
+        if sec == "workbenches" and self.workbenches and self.list_idx < len(self.workbenches):
             bench_name = self.workbenches[self.list_idx].get("name")
             wf_bench = BIN_DIR / "wf-workbench"
-            curses.endwin()
-            subprocess.run([str(wf_bench), "open", bench_name])
-            self.stdscr.refresh()
+            self.launch_external([str(wf_bench), "open", bench_name], wait=False)
+            return
 
         elif sec == "new_bench":
             self.prompt_create_workbench()
+            return
 
-        elif sec == "history" and self.history and self.list_idx < len(self.history):
-            url = self.history[self.list_idx].get("url")
-            if url:
-                curses.endwin()
-                subprocess.run([str(wf_open), url])
-                self.stdscr.refresh()
-
-        elif sec == "bookmarks" and self.bookmarks and self.list_idx < len(self.bookmarks):
-            url = self.bookmarks[self.list_idx].get("url")
-            if url:
-                curses.endwin()
-                subprocess.run([str(wf_open), url])
-                self.stdscr.refresh()
+        url = self.get_selected_url()
+        if url:
+            if force_tier == "TIER1":
+                self.launch_external([str(wf_reader), url], wait=True)
+            elif force_tier == "TIER3":
+                self.launch_external([str(wf_view), url], wait=False)
+            else:
+                self.launch_external([str(wf_open), url], wait=True)
 
     def prompt_create_workbench(self):
         curses.echo()

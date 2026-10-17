@@ -174,7 +174,8 @@ def main():
         if args.workbench:
             cmd.extend(["--workbench", args.workbench])
         cmd.append(url)
-        os.execv(str(view_bin), cmd)
+        # Detach GUI browser so the calling terminal / TUI returns immediately
+        subprocess.Popen(cmd, start_new_session=True)
 
 
 if __name__ == "__main__":
