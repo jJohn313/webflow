@@ -110,12 +110,34 @@ def probe_tier(url: str) -> str:
 
 
 def log_history(tier: str, url: str, title: str = ""):
-    history_file = Path.home() / ".local" / "share" / "webflow" / "history.txt"
-    history_file.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    share_dir = Path.home() / ".local" / "share" / "webflow"
+    share_dir.mkdir(parents=True, exist_ok=True)
+    history_file = share_dir / "history.txt"
+    history_jsonl = share_dir / "history.jsonl"
+
+    now = time.localtime()
+    date_str = time.strftime("%Y-%m-%d", now)
+    hour_str = time.strftime("%H:00 - %H:59", now)
+    time_str = time.strftime("%H:%M:%S", now)
+    timestamp = f"{date_str} {time_str}"
+
     title_clean = title.strip() or urllib.parse.urlparse(url).netloc
+
     with open(history_file, "a", encoding="utf-8") as f:
         f.write(f"{timestamp} | {tier} | {url} | {title_clean}\n")
+
+    entry = {
+        "timestamp": timestamp,
+        "date": date_str,
+        "hour": hour_str,
+        "time": time_str,
+        "tier": tier,
+        "url": url,
+        "title": title_clean,
+        "domain": urllib.parse.urlparse(url).netloc
+    }
+    with open(history_jsonl, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def main():

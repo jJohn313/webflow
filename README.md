@@ -49,6 +49,8 @@ Modern web browsers have devolved into multi-gigabyte monolithic operating syste
 ```text
 webflow/
 ├── bin/
+│   ├── webflow          # Flagship Yazi-style 3-pane TUI dashboard & ephemeral search
+│   ├── wf-workbench     # Persistent project workspace manager (JSON manifests)
 │   ├── wf-open          # Entry dispatcher & heuristic classifier (Python 3)
 │   ├── wf-reader        # Tier 1: Terminal Markdown extractor & Kitty/glow runner
 │   ├── wf-view          # Tier 3: Custom in-house WebKitGTK modal browser (PyGObject)
@@ -60,6 +62,32 @@ webflow/
 │   └── rules.conf       # Domain routing overrides (TIER1_ONLY, TIER3_ONLY)
 └── README.md
 ```
+
+---
+
+## 🖥️ The Yazi-Style Terminal Dashboard (`webflow`)
+
+Launch the 3-column TUI directly in your terminal:
+```bash
+webflow
+```
+
+* **Left Column (Sections)**:
+  * `⚡ Ephemeral Search`: Zero-engine live search (DuckDuckGo Lite / Wiby) directly in terminal.
+  * `📂 Workbenches`: Saved project workspaces (`University-Research`, `Work-Emails`, `Homelab-DIY`).
+  * `➕ New Workbench`: Initialize a dedicated project space.
+  * `📅 History`: Chronologically grouped time bands (`Date` -> `Hour` -> `Moment`).
+  * `🔖 Deliberate Bookmarks`: Explicitly tagged folders with custom notes.
+* **Middle Column (Active Items)**: Instant search query bar or filtered workspace/history list.
+* **Right Column (Live Preview & Route)**: Target URL, predicted tier (`Tier 1` Markdown vs `Tier 3` WebKitGTK), snippet text, or persisted workbench tabs.
+* **Keybindings**:
+  * `/` : Jump directly into Search prompt
+  * `h` / `l` / `Tab` : Switch between columns
+  * `j` / `k` : Move selection
+  * `Enter` : Open URL or Workbench (routes through `wf-open`)
+  * `w` : Add selected item to a Workbench
+  * `b` : Save deliberate bookmark with tag and custom note
+  * `q` : Quit TUI dashboard
 
 ---
 

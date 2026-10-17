@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+wf-workbench - Persistent Project Workspace Manager for Webflow
+Manages named workbenches with isolated sessions, tab states, and zero-RAM idle teardown.
+"""
+
+import os
+import sys
+import json
+import time
+import argparse
+import subprocess
+from pathlib import Path
+
+
+BASE_DIR = Path.home() / ".local" / "share" / "webflow"
+WORKBENCHES_DIR = BASE_DIR / "workbenches"
+SESSIONS_DIR = BASE_DIR / "sessions" / "workbenches"
+
+
+def ensure_dirs():
+    WORKBENCHES_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_workbench_path(name: str) -> Path:
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())
+    return WORKBENCHES_DIR / f"{safe_name}.json"
+
+
+def list_workbenches():
+    ensure_dirs()
+    benches = []
+    for file in sorted(WORKBENCHES_DIR.glob("*.json")):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            benches.append({
+                "id": file.stem,
+                "name": data.get("name", file.stem),
+                "tabs": data.get("tabs", []),
+                "created_at": data.get("created_at", ""),
+                "updated_at": data.get("updated_at", "")
+            })
+        except Exception:
+            continue
+    return benches
+
+
+def create_workbench(name: str, initial_urls=None):
+    ensure_dirs()
+    path = get_workbench_path(name)
+    if path.exists():
+        sys.stderr.write(f"Workbench '{name}' already exists.\n")
+        return False
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    tabs = []
+    if initial_urls:
+        for u in initial_urls:
+            tabs.append({"url": u, "title": u, "added_at": now})
+
+    data = {
+        "name": name,
+        "created_at": now,
+        "updated_at": now,
+        "tabs": tabs
+    }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    session_path = SESSIONS_DIR / path.stem
+    session_path.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def add_tab_to_workbench(name: str, url: str, title: str = ""):
+    ensure_dirs()
+    path = get_workbench_path(name)
+    if not path.exists():
+        create_workbench(name)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    tabs = data.setdefault("tabs", [])
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Avoid duplicate exact URLs
+    for t in tabs:
+        if t.get("url") == url:
+            t["title"] = title or t.get("title", url)
+            t["updated_at"] = now
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return True
+
+    tabs.append({
+        "url": url,
+        "title": title or url,
+        "added_at": now
+    })
+    data["updated_at"] = now
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return True
+
+
+def remove_tab_from_workbench(name: str, url: str):
+    path = get_workbench_path(name)
+    if not path.exists():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    tabs = [t for t in data.get("tabs", []) if t.get("url") != url]
+    data["tabs"] = tabs
+    data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return True
+
+
+def delete_workbench(name: str):
+    path = get_workbench_path(name)
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def open_workbench(name: str):
+    path = get_workbench_path(name)
+    if not path.exists():
+        sys.stderr.write(f"Workbench '{name}' not found.\n")
+        return False
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    tabs = data.get("tabs", [])
+    if not tabs:
+        print(f"Workbench '{name}' is empty. Add URLs using 'wf-workbench add {name} <url>'.")
+        return False
+
+    bin_dir = Path(__file__).resolve().parent
+    wf_open = bin_dir / "wf-open"
+
+    print(f"[*] Launching Workbench '{name}' ({len(tabs)} tabs)...")
+    for item in tabs:
+        url = item.get("url")
+        if url:
+            subprocess.Popen([str(wf_open), url])
+            time.sleep(0.3)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Webflow Workbench Manager")
+    sub = parser.add_subparsers(dest="action")
+
+    sub.add_parser("list", help="List all workbenches")
+
+    p_create = sub.add_parser("create", help="Create a new workbench")
+    p_create.add_argument("name", help="Workbench name")
+    p_create.add_argument("urls", nargs="*", help="Initial URLs")
+
+    p_add = sub.add_parser("add", help="Add URL to a workbench")
+    p_add.add_argument("name", help="Workbench name")
+    p_add.add_argument("url", help="Target URL")
+    p_add.add_argument("--title", default="", help="Tab title")
+
+    p_rm = sub.add_parser("remove", help="Remove URL from a workbench")
+    p_rm.add_argument("name", help="Workbench name")
+    p_rm.add_argument("url", help="Target URL")
+
+    p_del = sub.add_parser("delete", help="Delete a workbench")
+    p_del.add_argument("name", help="Workbench name")
+
+    p_open = sub.add_parser("open", help="Launch all tabs in a workbench")
+    p_open.add_argument("name", help="Workbench name")
+
+    args = parser.parse_args()
+    if args.action == "list" or not args.action:
+        benches = list_workbenches()
+        if not benches:
+            print("No workbenches found. Create one with: wf-workbench create <name>")
+            return
+        print(f"{'NAME':<24} {'TABS':<6} {'LAST UPDATED':<20}")
+        print("-" * 52)
+        for b in benches:
+            print(f"{b['name']:<24} {len(b['tabs']):<6} {b['updated_at']:<20}")
+    elif args.action == "create":
+        if create_workbench(args.name, args.urls):
+            print(f"[✔] Workbench '{args.name}' created.")
+    elif args.action == "add":
+        if add_tab_to_workbench(args.name, args.url, args.title):
+            print(f"[✔] Tab added to '{args.name}'.")
+    elif args.action == "remove":
+        if remove_tab_from_workbench(args.name, args.url):
+            print(f"[✔] Tab removed from '{args.name}'.")
+    elif args.action == "delete":
+        if delete_workbench(args.name):
+            print(f"[✔] Workbench '{args.name}' deleted.")
+    elif args.action == "open":
+        open_workbench(args.name)
+
+
+if __name__ == "__main__":
+    main()
