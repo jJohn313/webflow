@@ -1,77 +1,212 @@
-#!/usr/bin/env bash
-# wf-pass - Active-Window Credential Injector for Webflow
-set -euo pipefail
+#!/usr/bin/env python3
+"""
+wf-pass - Active-Window Credential Vault & Autofill Dispatcher for Webflow
+"""
+import os
+import sys
+import json
+import time
+import getpass
+import argparse
+import subprocess
+from pathlib import Path
 
-WINDOW_INFO=""
-if command -v hyprctl >/dev/null 2>&1; then
-    WINDOW_INFO="$(hyprctl activewindow -j 2>/dev/null || true)"
-fi
+# Add repo root to import lib.vault
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from lib.vault import WebflowVault, extract_domain_parts
 
-DOMAIN=""
-if [[ -n "${WINDOW_INFO}" ]]; then
-    TITLE=$(echo "${WINDOW_INFO}" | grep -o '"title": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
-    # 1. Try explicit (@domain.com) marker from wf-view
-    DOMAIN=$(echo "${TITLE}" | grep -oE '\(@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\)' | tr -d '(@)' | head -n1 || true)
-    # 2. Fallback to any domain pattern in title
-    if [[ -z "${DOMAIN}" ]]; then
-        DOMAIN=$(echo "${TITLE}" | grep -oE '([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}' | head -n1 || true)
-    fi
-fi
 
-if [[ -z "${DOMAIN}" ]]; then
-    if command -v rofi >/dev/null 2>&1; then
-        DOMAIN=$(rofi -dmenu -p "Login domain: " || true)
-    else
-        read -r -p "Target domain for credentials: " DOMAIN
-    fi
-fi
+def get_active_window_domain() -> str:
+    """Attempts to detect domain from Hyprland active window."""
+    try:
+        out = subprocess.check_output(["hyprctl", "activewindow", "-j"], stderr=subprocess.DEVNULL)
+        win = json.loads(out)
+        title = win.get("title", "")
+        # Check for explicit (@domain.com) tag from wf-view
+        import re
+        m = re.search(r'\(@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\)', title)
+        if m:
+            return m.group(1)
+        # Fallback to any domain in title
+        m2 = re.search(r'([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}', title)
+        if m2:
+            return m2.group(0)
+    except Exception:
+        pass
+    return ""
 
-if [[ -z "${DOMAIN}" ]]; then
-    echo "[-] No domain detected or specified."
-    exit 1
-fi
 
-echo "[*] Searching credentials for domain: ${DOMAIN}"
+def prompt_rofi_or_input(prompt: str) -> str:
+    try:
+        p = subprocess.run(["rofi", "-dmenu", "-p", prompt], stdout=subprocess.PIPE, text=True, check=True)
+        return p.stdout.strip()
+    except Exception:
+        try:
+            return input(f"{prompt}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return ""
 
-USER=""
-PASS=""
 
-# Try rbw (Bitwarden CLI)
-if command -v rbw >/dev/null 2>&1 && rbw unlocked >/dev/null 2>&1; then
-    ENTRY_ID=$(rbw list --fields id,name,user 2>/dev/null | grep -i "${DOMAIN}" | head -n1 | cut -f1 || true)
-    if [[ -n "${ENTRY_ID}" ]]; then
-        USER=$(rbw get --field username "${ENTRY_ID}" 2>/dev/null || true)
-        PASS=$(rbw get "${ENTRY_ID}" 2>/dev/null | head -n1 || true)
-    fi
-fi
+def type_credentials(username: str, password: str):
+    """Types credentials using wtype into the currently focused window."""
+    wtype = "/home/john/.local/bin/wtype" if Path("/home/john/.local/bin/wtype").exists() else "wtype"
+    try:
+        time.sleep(0.1)
+        if username:
+            subprocess.run([wtype, "-s", "15", "--", username], check=True)
+            subprocess.run([wtype, "-k", "Tab"], check=True)
+            time.sleep(0.05)
+        subprocess.run([wtype, "-s", "15", "--", password], check=True)
+        subprocess.run([wtype, "-k", "Return"], check=True)
+    except Exception as e:
+        sys.stderr.write(f"[-] Failed to synthesize keystrokes via wtype: {e}\n")
 
-# Try pass (standard unix password store)
-if [[ -z "${PASS}" ]] && command -v pass >/dev/null 2>&1; then
-    PASS_ENTRY=$(pass find "${DOMAIN}" 2>/dev/null | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' | grep -v 'Search terms' | grep -v '/$' | head -n1 | sed 's/^[├└─│ ]*//;s/\.gpg$//' || true)
-    if [[ -n "${PASS_ENTRY}" ]]; then
-        STORE_DIR="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
-        FULL_ENTRY=$(find "${STORE_DIR}" -type f -iname "*${DOMAIN}*.gpg" 2>/dev/null | head -n1 | sed "s|^${STORE_DIR}/||;s|\.gpg$||" || true)
-        TARGET_ENTRY="${FULL_ENTRY:-$PASS_ENTRY}"
-        PASS=$(pass show "${TARGET_ENTRY}" 2>/dev/null | head -n1 || true)
-        USER=$(pass show "${TARGET_ENTRY}" 2>/dev/null | grep -iE '^(user|username|login|email):' | head -n1 | cut -d':' -f2- | xargs || true)
-    fi
-fi
 
-if [[ -z "${PASS}" ]]; then
-    echo "[-] No matching credentials found in rbw or pass for ${DOMAIN}."
-    exit 1
-fi
+def cmd_list(vault: WebflowVault, args):
+    accounts = vault.list_accounts()
+    if not accounts:
+        print("[*] Webflow vault is empty. No credentials saved yet.")
+        return
 
-if ! command -v wtype >/dev/null 2>&1; then
-    echo "[-] wtype utility is required for keystroke synthesis."
-    exit 1
-fi
+    print(f"{'DOMAIN':<30} {'USERNAME':<30} {'LAST UPDATED'}")
+    print("-" * 75)
+    for acc in accounts:
+        domain = acc.get("domain", "")
+        user = acc.get("username", "")
+        updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(acc.get("updated_at", 0))) if acc.get("updated_at") else "-"
+        print(f"{domain:<30} {user:<30} {updated}")
 
-sleep 0.1
-if [[ -n "${USER}" ]]; then
-    wtype -s 15 -- "${USER}"
-    wtype -k Tab
-    sleep 0.05
-fi
-wtype -s 15 -- "${PASS}"
-wtype -k Return
+
+def cmd_get(vault: WebflowVault, args):
+    domain = args.domain.strip()
+    creds = vault.get_all_for_domain(domain)
+    if not creds:
+        sys.stderr.write(f"[-] No credentials found for {domain}\n")
+        sys.exit(1)
+
+    if args.username:
+        creds = [c for c in creds if c["username"] == args.username]
+        if not creds:
+            sys.stderr.write(f"[-] No credentials found for {domain} with username {args.username}\n")
+            sys.exit(1)
+
+    primary = creds[0]
+    if args.json:
+        print(json.dumps(primary, indent=2))
+    elif args.pass_only:
+        print(primary["password"])
+    else:
+        print(f"Domain:   {primary['domain']}")
+        print(f"Username: {primary['username']}")
+        print(f"Password: {primary['password']}")
+
+
+def cmd_add(vault: WebflowVault, args):
+    domain = args.domain.strip()
+    user = args.username
+    if not user:
+        user = input(f"Username for {domain}: ").strip()
+    if not user:
+        print("[-] Username cannot be empty.")
+        return
+
+    pwd = args.password
+    if not pwd:
+        pwd = getpass.getpass(f"Password for {user}@{domain}: ").strip()
+    if not pwd:
+        print("[-] Password cannot be empty.")
+        return
+
+    if vault.save_credentials(domain, user, pwd):
+        print(f"[+] Saved credentials for {user} on {domain}")
+    else:
+        print(f"[-] Failed to save credentials for {domain}")
+
+
+def cmd_rm(vault: WebflowVault, args):
+    domain = args.domain.strip()
+    if vault.delete_credentials(domain, args.username):
+        user_str = f" ({args.username})" if args.username else ""
+        print(f"[+] Deleted credentials for {domain}{user_str}")
+    else:
+        print(f"[-] Failed to delete credentials for {domain}")
+
+
+def cmd_generate(vault: WebflowVault, args):
+    length = getattr(args, "opt_len", None) or args.length or 24
+    pwd = vault.generate_password(length)
+    print(pwd)
+
+
+def cmd_autofill(vault: WebflowVault, args):
+    domain = args.domain
+    if not domain:
+        domain = get_active_window_domain()
+    if not domain:
+        domain = prompt_rofi_or_input("Target login domain")
+    if not domain:
+        sys.stderr.write("[-] No domain detected or specified.\n")
+        sys.exit(1)
+
+    creds = vault.get_credentials(domain)
+    if not creds:
+        sys.stderr.write(f"[-] No credentials found for {domain}\n")
+        sys.exit(1)
+
+    user, pwd = creds
+    type_credentials(user, pwd)
+
+
+def main():
+    vault = WebflowVault()
+
+    parser = argparse.ArgumentParser(description="Webflow Sovereign Credential Vault")
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    # list
+    p_list = subparsers.add_parser("list", help="List saved accounts")
+    p_list.set_defaults(func=lambda args: cmd_list(vault, args))
+
+    # get
+    p_get = subparsers.add_parser("get", help="Get credentials for a domain")
+    p_get.add_argument("domain", help="Domain or URL")
+    p_get.add_argument("-u", "--username", help="Filter by username")
+    p_get.add_argument("-p", "--pass-only", action="store_true", help="Output password only")
+    p_get.add_argument("--json", action="store_true", help="Output as JSON")
+    p_get.set_defaults(func=lambda args: cmd_get(vault, args))
+
+    # add / save
+    p_add = subparsers.add_parser("add", help="Save credentials for a domain")
+    p_add.add_argument("domain", help="Domain or URL")
+    p_add.add_argument("username", nargs="?", help="Username or email")
+    p_add.add_argument("password", nargs="?", help="Password")
+    p_add.set_defaults(func=lambda args: cmd_add(vault, args))
+
+    # rm
+    p_rm = subparsers.add_parser("rm", help="Remove credentials for a domain")
+    p_rm.add_argument("domain", help="Domain or URL")
+    p_rm.add_argument("username", nargs="?", help="Specific username to delete")
+    p_rm.set_defaults(func=lambda args: cmd_rm(vault, args))
+
+    # generate
+    p_gen = subparsers.add_parser("generate", help="Generate secure password")
+    p_gen.add_argument("length", nargs="?", type=int, default=24, help="Password length (default 24)")
+    p_gen.add_argument("-l", "--len", dest="opt_len", type=int, default=None, help="Password length")
+    p_gen.set_defaults(func=lambda args: cmd_generate(vault, args))
+
+    # autofill
+    p_auto = subparsers.add_parser("autofill", help="Autofill active window via wtype")
+    p_auto.add_argument("domain", nargs="?", help="Domain (optional, auto-detected from active window)")
+    p_auto.set_defaults(func=lambda args: cmd_autofill(vault, args))
+
+    args = parser.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        # Default behavior: autofill active window
+        cmd_autofill(vault, args)
+
+
+if __name__ == "__main__":
+    main()

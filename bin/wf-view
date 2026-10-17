@@ -43,6 +43,10 @@ except Exception:
         log_error(f"Error loading WebKit2GTK / GTK 3.0: {e}\nEnsure 'webkit2gtk-4.1' and 'python-gobject' are installed.")
         sys.exit(1)
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from lib.vault import WebflowVault
+
 
 def extract_root_domain(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
@@ -66,6 +70,12 @@ class WebflowViewer(Gtk.Window):
         self.mode = "NORMAL"  # NORMAL | INSERT | HINTS | SEARCH
         self.pending_g = False
         self.search_text = ""
+        self.status_notification = ""
+
+        # Credential Vault & Autofill
+        self.vault = WebflowVault()
+        self.autofill_script_path = REPO_ROOT / "assets" / "autofill.js"
+        self.pending_credentials = None
 
         # Paths: Always use per-domain session storage so logins persist seamlessly
         # between Ephemeral mode and Workbenches!
@@ -79,7 +89,7 @@ class WebflowViewer(Gtk.Window):
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.bookmarks_file = self.base_share / "bookmarks.txt"
-        self.hints_script_path = Path(__file__).resolve().parent.parent / "assets" / "hints.js"
+        self.hints_script_path = REPO_ROOT / "assets" / "hints.js"
 
         self.setup_window()
         self.setup_engine()
@@ -94,6 +104,22 @@ class WebflowViewer(Gtk.Window):
         self.set_default_size(1280, 800)
         self.set_decorated(False)
         self.connect("destroy", self.on_quit)
+
+        # Root vertical layout: InfoBar on top, WebView below
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(self.main_box)
+
+        # InfoBar for sovereign password save prompts
+        self.infobar = Gtk.InfoBar()
+        self.infobar.set_no_show_all(True)
+        self.infobar.set_message_type(Gtk.MessageType.QUESTION)
+        self.infobar_label = Gtk.Label()
+        self.infobar.get_content_area().add(self.infobar_label)
+        self.infobar.add_button("Save (y)", Gtk.ResponseType.ACCEPT)
+        self.infobar.add_button("Never (n)", Gtk.ResponseType.REJECT)
+        self.infobar.add_button("Dismiss (Esc)", Gtk.ResponseType.CLOSE)
+        self.infobar.connect("response", self.on_infobar_response)
+        self.main_box.pack_start(self.infobar, False, False, 0)
 
     def setup_engine(self):
         # Safe WebsiteDataManager creation across WebKit2 4.0 / 4.1
@@ -118,6 +144,7 @@ class WebflowViewer(Gtk.Window):
         self.ucm.register_script_message_handler("webflow")
         self.ucm.connect("script-message-received::webflow", self.on_js_message)
 
+        # Inject focus observer script
         focus_observer_js = """
         (function() {
             function isEditable(el) {
@@ -147,6 +174,18 @@ class WebflowViewer(Gtk.Window):
         )
         self.ucm.add_script(user_script)
 
+        # Inject autofill & credential watcher script
+        if self.autofill_script_path.exists():
+            autofill_js = self.autofill_script_path.read_text(encoding="utf-8")
+            user_script_autofill = WebKit.UserScript.new(
+                autofill_js,
+                WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit.UserScriptInjectionTime.END,
+                None,
+                None
+            )
+            self.ucm.add_script(user_script_autofill)
+
         # Create WebView with both context and user_content_manager via GObject
         self.web_view = GObject_new_webview(web_context, self.ucm)
 
@@ -161,12 +200,17 @@ class WebflowViewer(Gtk.Window):
 
         self.web_view.connect("notify::title", self.on_title_changed)
         self.web_view.connect("notify::uri", self.on_uri_changed)
+        self.web_view.connect("load-changed", self.on_load_changed)
         self.web_view.connect("decide-policy", self.on_decide_policy)
         self.web_view.connect("create", self.on_create_web_view)
 
-        self.add(self.web_view)
+        self.main_box.pack_start(self.web_view, True, True, 0)
         self.show_all()
         self.update_title()
+
+    def on_load_changed(self, view, load_event):
+        if load_event == WebKit.LoadEvent.FINISHED:
+            self.try_autofill()
 
     def on_create_web_view(self, web_view, navigation_action):
         req = navigation_action.get_request()
@@ -184,6 +228,44 @@ class WebflowViewer(Gtk.Window):
             return True
         return False
 
+    def try_autofill(self, domain=None):
+        target_domain = domain or self.root_domain
+        creds = self.vault.get_credentials(target_domain)
+        if creds:
+            u, p = creds
+            js = f"if (window.__wf_autofill) window.__wf_autofill({json.dumps(u)}, {json.dumps(p)});"
+            self.eval_js(js)
+            self.set_status_notification(f"🔐 Autofilled: {u}")
+
+    def set_status_notification(self, text: str):
+        self.status_notification = text
+        self.update_title()
+        GLib.timeout_add_seconds(3, self._clear_status_notification)
+
+    def _clear_status_notification(self):
+        self.status_notification = ""
+        self.update_title()
+        return False
+
+    def prompt_save_credentials(self, domain: str, username: str, password: str):
+        self.pending_credentials = (domain, username, password)
+        display_user = f"'{username}' " if username else ""
+        self.infobar_label.set_text(f"🔐 Save password for {display_user}on {domain}?")
+        self.infobar.show()
+
+    def on_infobar_response(self, infobar, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT and self.pending_credentials:
+            d, u, p = self.pending_credentials
+            user_to_save = u if u else "user"
+            self.vault.save_credentials(d, user_to_save, p)
+            self.set_status_notification(f"🔐 Saved login for {user_to_save}")
+        elif response_id == Gtk.ResponseType.REJECT and self.pending_credentials:
+            d, _, _ = self.pending_credentials
+            self.vault.ignore_domain(d)
+            self.set_status_notification(f"[-] Never save for {d}")
+        self.pending_credentials = None
+        self.infobar.hide()
+
     def eval_js(self, script: str):
         if hasattr(self.web_view, "evaluate_javascript"):
             self.web_view.evaluate_javascript(script, -1, None, None, None, None, None)
@@ -197,7 +279,8 @@ class WebflowViewer(Gtk.Window):
         page_title = self.web_view.get_title() or self.root_domain
         wb_tag = f" [WB:{self.workbench}]" if self.workbench else ""
         search_tag = f" [/{self.search_text}]" if self.mode == "SEARCH" else ""
-        self.set_title(f"wf-view [{self.mode}]{wb_tag}{search_tag} (@{self.root_domain}) - {page_title}")
+        notif_tag = f" [{self.status_notification}]" if self.status_notification else ""
+        self.set_title(f"wf-view [{self.mode}]{wb_tag}{search_tag}{notif_tag} (@{self.root_domain}) - {page_title}")
 
     def on_title_changed(self, view, param):
         self.update_title()
@@ -244,6 +327,17 @@ class WebflowViewer(Gtk.Window):
                 if self.mode == "HINTS":
                     self.mode = "NORMAL"
                     self.update_title()
+            elif action == "request_autofill":
+                dom = data.get("domain") or self.root_domain
+                self.try_autofill(dom)
+            elif action == "credentials_detected":
+                dom = data.get("domain") or self.root_domain
+                u = data.get("username", "").strip()
+                pwd = data.get("password", "")
+                if pwd and not self.vault.is_domain_ignored(dom):
+                    existing = self.vault.get_credentials(dom)
+                    if not existing or existing[1] != pwd or (u and existing[0] != u):
+                        self.prompt_save_credentials(dom, u, pwd)
         except Exception:
             pass
 
@@ -254,6 +348,17 @@ class WebflowViewer(Gtk.Window):
         keyname = Gdk.keyval_name(event.keyval)
         if not keyname:
             return False
+
+        if self.infobar.get_visible():
+            if keyname in ("y", "Y"):
+                self.on_infobar_response(self.infobar, Gtk.ResponseType.ACCEPT)
+                return True
+            elif keyname in ("n", "N"):
+                self.on_infobar_response(self.infobar, Gtk.ResponseType.REJECT)
+                return True
+            elif keyname == "Escape":
+                self.on_infobar_response(self.infobar, Gtk.ResponseType.CLOSE)
+                return True
 
         if keyname == "Escape":
             self.mode = "NORMAL"
@@ -369,6 +474,18 @@ class WebflowViewer(Gtk.Window):
             return True
         elif keyname == "f":
             self.trigger_hints()
+            return True
+        elif keyname == "p":
+            creds = self.vault.get_credentials(self.root_domain)
+            if creds:
+                u, pwd = creds
+                self.eval_js(f"if (window.__wf_autofill) window.__wf_autofill({json.dumps(u)}, {json.dumps(pwd)});")
+                self.set_status_notification(f"🔐 Autofilled: {u}")
+            else:
+                self.set_status_notification(f"[-] No saved login for {self.root_domain}")
+            return True
+        elif keyname == "P":
+            self.eval_js("if (window.__wf_capture_credentials) window.__wf_capture_credentials();")
             return True
 
         self.pending_g = False

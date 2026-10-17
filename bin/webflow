@@ -19,6 +19,9 @@ WORKBENCHES_DIR = BASE_DIR / "workbenches"
 HISTORY_JSONL = BASE_DIR / "history.jsonl"
 BOOKMARKS_FILE = BASE_DIR / "bookmarks.txt"
 BIN_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BIN_DIR.parent
+sys.path.insert(0, str(REPO_ROOT))
+from lib.vault import WebflowVault, extract_domain_parts
 
 
 def ensure_dirs():
@@ -306,7 +309,10 @@ class WebflowTUI:
         self.wb_picker_url = None
         self.wb_picker_title = ""
 
-        self.status_msg = "NORMAL  |  / Search  |  Enter Open  |  v GUI  |  r Reader  |  w Add to Bench  |  b Mark  |  q Quit"
+        # Sovereign Credential Vault
+        self.vault = WebflowVault()
+
+        self.status_msg = "NORMAL  |  / Search  |  Enter Open  |  v GUI  |  w Bench  |  P Vault  |  q Quit"
 
         self.workbenches = load_workbenches()
         self.history = load_history()
@@ -607,16 +613,27 @@ class WebflowTUI:
             self.safe_addstr(py + 12, px + 2, f"Visits: {h_entry.get('count', 1)} time(s) on this date", curses.color_pair(4) | curses.A_BOLD)
             self.safe_addstr(py + 14, px + 2, f"Route:  {h_entry.get('tier', '')}", curses.color_pair(3))
 
+            dom = h_entry.get('domain', '')
+            creds = self.vault.get_all_for_domain(dom)
+            if creds:
+                users = ", ".join(c["username"] for c in creds)
+                self.safe_addstr(py + 16, px + 2, f"Vault:  🔐 Saved login ({users})"[:pw-4], curses.color_pair(2) | curses.A_BOLD)
+
         elif section == "bookmarks" and self.bookmarks and self.list_idx < len(self.bookmarks):
             bm = self.bookmarks[self.list_idx]
             self.safe_addstr(py + 2, px + 2, f"Tag:   [{bm.get('tag', 'general')}]", curses.color_pair(4) | curses.A_BOLD)
             self.safe_addstr(py + 4, px + 2, f"Note:  {bm.get('title', '')[:pw-9]}", curses.color_pair(7) | curses.A_BOLD)
             self.safe_addstr(py + 6, px + 2, f"URL:   {bm.get('url', '')[:pw-9]}", curses.color_pair(2))
+
+            creds = self.vault.get_all_for_domain(bm.get('url', ''))
+            if creds:
+                users = ", ".join(c["username"] for c in creds)
+                self.safe_addstr(py + 8, px + 2, f"Vault: 🔐 Saved login ({users})"[:pw-4], curses.color_pair(2) | curses.A_BOLD)
         else:
             self.safe_addstr(py + 3, px + 3, "Select an item to preview details.", curses.color_pair(7))
 
         self.safe_addstr(py + ph - 3, px + 2, "─" * (pw - 4), curses.color_pair(7))
-        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [r] Reader | [w] Bench", curses.color_pair(1))
+        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [w] Bench | [P] Vault", curses.color_pair(1))
 
     def draw_workbench_picker_modal(self, h, w):
         options = [b.get("name") for b in self.workbenches] + ["➕ Create New Workbench..."]
@@ -743,6 +760,21 @@ class WebflowTUI:
             self.delete_selected_item()
         elif key == ord('C'):
             self.clear_history()
+        elif key in [ord('P'), ord('p')]:
+            self.show_vault_info_for_selected()
+
+    def show_vault_info_for_selected(self):
+        target_url, _ = self.get_selected_url_and_title()
+        if target_url:
+            dom = extract_domain_parts(target_url)[1]
+            creds = self.vault.get_all_for_domain(dom)
+            if creds:
+                users = ", ".join(c["username"] for c in creds)
+                self.status_msg = f"🔐 Vault [{dom}]: user '{users}' saved. (CLI: wf-pass get {dom})"
+            else:
+                self.status_msg = f"[-] No saved login for {dom}. (CLI: wf-pass add {dom} <user>)"
+        else:
+            self.status_msg = "[*] Webflow Vault active. Use 'wf-pass list' to inspect all accounts."
 
     def prompt_line_input(self, prompt_label: str, max_chars: int = 45) -> str:
         curses.echo()
