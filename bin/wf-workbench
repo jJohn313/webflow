@@ -132,14 +132,14 @@ def open_workbench(name: str):
         return False
 
     bin_dir = Path(__file__).resolve().parent
-    wf_open = bin_dir / "wf-open"
+    wf_view = bin_dir / "wf-view"
 
     print(f"[*] Launching Workbench '{name}' ({len(tabs)} tabs)...")
     for item in tabs:
         url = item.get("url")
         if url:
-            subprocess.Popen([str(wf_open), url])
-            time.sleep(0.3)
+            subprocess.Popen([str(wf_view), "--workbench", name, url])
+            time.sleep(0.25)
     return True
 
 

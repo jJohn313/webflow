@@ -3,15 +3,15 @@
 wf-view - Tier 3: In-House Modal WebKitGTK Browser for Webflow
 High-performance, chromeless, single-process Wayland client with Vim modal navigation.
 """
-
 import os
 import sys
 import json
+import time
+import argparse
 import urllib.parse
 import subprocess
 from pathlib import Path
 
-# Ensure Wayland backend for GTK
 os.environ.setdefault("GDK_BACKEND", "wayland,x11")
 
 import gi
@@ -19,14 +19,10 @@ try:
     gi.require_version("WebKit2", "4.1")
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
-except ValueError:
-    try:
-        gi.require_version("WebKit", "6.0")
-        gi.require_version("Gtk", "4.0")
-        from gi.repository import Gtk, Gdk, GLib, WebKit
-    except ValueError as e:
-        sys.stderr.write(f"Error loading WebKitGTK: {e}\n")
-        sys.exit(1)
+except ValueError as e:
+    sys.stderr.write(f"Error loading WebKit2GTK 4.1 / GTK 3.0: {e}\n")
+    sys.stderr.write("Ensure 'webkit2gtk-4.1' and 'python-gobject' are installed.\n")
+    sys.exit(1)
 
 
 def extract_root_domain(url: str) -> str:
@@ -36,21 +32,33 @@ def extract_root_domain(url: str) -> str:
         return "local"
     parts = netloc.split(".")
     if len(parts) >= 2:
+        # Handle two-part TLDs like co.uk, org.uk, com.au
+        if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) == 2:
+            return ".".join(parts[-3:])
         return ".".join(parts[-2:])
     return netloc
 
 
 class WebflowViewer(Gtk.Window):
-    def __init__(self, initial_url: str):
+    def __init__(self, initial_url: str, workbench: str = None):
         super().__init__()
         self.initial_url = initial_url if "://" in initial_url else f"https://{initial_url}"
         self.root_domain = extract_root_domain(self.initial_url)
-        self.mode = "NORMAL"  # NORMAL | INSERT | HINTS
+        self.workbench = workbench
+        self.mode = "NORMAL"  # NORMAL | INSERT | HINTS | SEARCH
         self.pending_g = False
+        self.search_text = ""
 
         # Paths
         self.base_share = Path.home() / ".local" / "share" / "webflow"
-        self.session_dir = self.base_share / "sessions" / self.root_domain
+        if self.workbench:
+            safe_wb = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.workbench.strip())
+            self.session_dir = self.base_share / "sessions" / "workbenches" / safe_wb
+            self.wb_manifest = self.base_share / "workbenches" / f"{safe_wb}.json"
+        else:
+            self.session_dir = self.base_share / "sessions" / self.root_domain
+            self.wb_manifest = None
+
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.bookmarks_file = self.base_share / "bookmarks.txt"
         self.hints_script_path = Path(__file__).resolve().parent.parent / "assets" / "hints.js"
@@ -58,58 +66,49 @@ class WebflowViewer(Gtk.Window):
         self.setup_window()
         self.setup_engine()
         self.setup_keybindings()
-
         self.load_url(self.initial_url)
 
     def setup_window(self):
-        self.set_title(f"wf-view [{self.mode}] - {self.root_domain}")
+        self.set_wmclass("wf-view", "wf-view")
         self.set_default_size(1280, 800)
         self.set_decorated(False)
         self.connect("destroy", self.on_quit)
 
     def setup_engine(self):
-        # Configure isolated session
         data_manager = WebKit.WebsiteDataManager(
             base_data_directory=str(self.session_dir),
             base_cache_directory=str(self.session_dir / "cache"),
             local_storage_directory=str(self.session_dir / "localstorage"),
             disk_cache_directory=str(self.session_dir / "diskcache")
         )
-
         cookie_manager = data_manager.get_cookie_manager()
         cookie_manager.set_persistent_storage(
             str(self.session_dir / "cookies.sqlite"),
             WebKit.CookiePersistentStorage.SQLITE
         )
+        cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NO_THIRD_PARTY)
 
         web_context = WebKit.WebContext.new_with_website_data_manager(data_manager)
 
-        # Message handler for JavaScript -> Python IPC
         self.ucm = WebKit.UserContentManager()
         self.ucm.register_script_message_handler("webflow")
         self.ucm.connect("script-message-received::webflow", self.on_js_message)
 
-        # Auto-focus listener script to update modal state
         focus_observer_js = """
         (function() {
-            window.addEventListener('focusin', function(e) {
-                var el = e.target;
-                if (!el) return;
+            function isEditable(el) {
+                if (!el) return false;
                 var tag = (el.tagName || '').toLowerCase();
-                var isEditable = el.isContentEditable || tag === 'textarea' ||
+                return el.isContentEditable || tag === 'textarea' ||
                     (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
-                if (isEditable && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+            }
+            window.addEventListener('focusin', function(e) {
+                if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
                     window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'INSERT'}));
                 }
             }, true);
-
             window.addEventListener('focusout', function(e) {
-                var el = e.target;
-                if (!el) return;
-                var tag = (el.tagName || '').toLowerCase();
-                var isEditable = el.isContentEditable || tag === 'textarea' ||
-                    (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
-                if (isEditable && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+                if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
                     window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'NORMAL'}));
                 }
             }, true);
@@ -125,21 +124,42 @@ class WebflowViewer(Gtk.Window):
         self.ucm.add_script(user_script)
 
         self.web_view = WebKit.WebView.new_with_context(web_context)
-        # Apply user content manager
         if hasattr(self.web_view, "set_user_content_manager"):
             self.web_view.set_user_content_manager(self.ucm)
 
-        # Settings
         settings = self.web_view.get_settings()
         settings.set_enable_developer_extras(False)
         settings.set_enable_smooth_scrolling(True)
         settings.set_javascript_can_open_windows_automatically(False)
+        settings.set_enable_back_forward_navigation_gestures(True)
+
+        self.find_controller = self.web_view.get_find_controller()
 
         self.web_view.connect("notify::title", self.on_title_changed)
         self.web_view.connect("notify::uri", self.on_uri_changed)
+        self.web_view.connect("decide-policy", self.on_decide_policy)
+        self.web_view.connect("create", self.on_create_web_view)
 
         self.add(self.web_view)
         self.show_all()
+        self.update_title()
+
+    def on_create_web_view(self, web_view, navigation_action):
+        # Redirect popups / target="_blank" into current view
+        req = navigation_action.get_request()
+        if req and req.get_uri():
+            self.web_view.load_uri(req.get_uri())
+        return None
+
+    def on_decide_policy(self, web_view, decision, decision_type):
+        if decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
+            nav_action = decision.get_navigation_action()
+            req = nav_action.get_request()
+            if req and req.get_uri():
+                self.web_view.load_uri(req.get_uri())
+            decision.ignore()
+            return True
+        return False
 
     def eval_js(self, script: str):
         if hasattr(self.web_view, "evaluate_javascript"):
@@ -151,8 +171,11 @@ class WebflowViewer(Gtk.Window):
         self.web_view.load_uri(url)
 
     def update_title(self):
+        # Always include (@domain) in title so wf-pass can reliably extract it via hyprctl
         page_title = self.web_view.get_title() or self.root_domain
-        self.set_title(f"wf-view [{self.mode}] {page_title}")
+        wb_tag = f" [WB:{self.workbench}]" if self.workbench else ""
+        search_tag = f" [/{self.search_text}]" if self.mode == "SEARCH" else ""
+        self.set_title(f"wf-view [{self.mode}]{wb_tag}{search_tag} (@{self.root_domain}) - {page_title}")
 
     def on_title_changed(self, view, param):
         self.update_title()
@@ -187,26 +210,48 @@ class WebflowViewer(Gtk.Window):
         if not keyname:
             return False
 
-        # Global Escape: always drop to NORMAL mode and blur inputs
+        # Global Escape: always drop to NORMAL mode, clear search/hints, blur inputs
         if keyname == "Escape":
             self.mode = "NORMAL"
             self.pending_g = False
-            self.eval_js("if (document.activeElement) document.activeElement.blur(); if (window.__wf_cleanup_hints) window.__wf_cleanup_hints();")
+            self.find_controller.search_finish()
+            self.eval_js(
+                "if (document.activeElement) document.activeElement.blur(); "
+                "if (window.__wf_cleanup_hints) window.__wf_cleanup_hints();"
+            )
             self.update_title()
             return True
 
-        if self.mode == "INSERT":
-            return False  # Let GTK/WebKit process input normally
+        if self.mode == "SEARCH":
+            if keyname in ("Return", "KP_Enter"):
+                self.mode = "NORMAL"
+                if self.search_text:
+                    self.find_controller.search(
+                        self.search_text,
+                        WebKit.FindOptions.CASE_INSENSITIVE | WebKit.FindOptions.WRAP_AROUND,
+                        1000
+                    )
+                self.update_title()
+            elif keyname == "BackSpace":
+                self.search_text = self.search_text[:-1]
+                self.update_title()
+            elif len(keyname) == 1 and 32 <= event.keyval <= 126:
+                self.search_text += chr(event.keyval)
+                self.update_title()
+            elif keyname == "space":
+                self.search_text += " "
+                self.update_title()
+            return True
 
-        if self.mode == "HINTS":
-            return False  # Let injected hints.js capture keystrokes
+        if self.mode in ("INSERT", "HINTS"):
+            return False
 
         # NORMAL MODE KEYBINDINGS
         if keyname == "j":
-            self.eval_js("window.scrollBy({top: 100, behavior: 'smooth'});")
+            self.eval_js("window.scrollBy({top: 120, behavior: 'smooth'});")
             return True
         elif keyname == "k":
-            self.eval_js("window.scrollBy({top: -100, behavior: 'smooth'});")
+            self.eval_js("window.scrollBy({top: -120, behavior: 'smooth'});")
             return True
         elif keyname == "d":
             self.eval_js("window.scrollBy({top: window.innerHeight * 0.5, behavior: 'smooth'});")
@@ -234,6 +279,38 @@ class WebflowViewer(Gtk.Window):
             return True
         elif keyname == "r":
             self.web_view.reload()
+            return True
+        elif keyname == "R":
+            self.web_view.reload_bypass_cache()
+            return True
+        elif keyname == "slash":
+            self.mode = "SEARCH"
+            self.search_text = ""
+            self.update_title()
+            return True
+        elif keyname == "n":
+            if self.search_text:
+                self.find_controller.search_next()
+            return True
+        elif keyname == "N":
+            if self.search_text:
+                self.find_controller.search_previous()
+            return True
+        elif keyname in ("plus", "equal"):
+            self.web_view.set_zoom_level(self.web_view.get_zoom_level() + 0.1)
+            return True
+        elif keyname == "minus":
+            self.web_view.set_zoom_level(max(0.3, self.web_view.get_zoom_level() - 0.1))
+            return True
+        elif keyname == "0":
+            self.web_view.set_zoom_level(1.0)
+            return True
+        elif keyname == "E":
+            # Demote current page to wf-reader inside a new terminal or stdout
+            uri = self.web_view.get_uri() or self.initial_url
+            wf_reader = Path(__file__).resolve().parent / "wf-reader"
+            subprocess.Popen(["kitty", "-e", str(wf_reader), uri])
+            self.on_quit()
             return True
         elif keyname == "b":
             self.bookmark_current()
@@ -271,7 +348,7 @@ class WebflowViewer(Gtk.Window):
         title = self.web_view.get_title() or self.root_domain
         self.bookmarks_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.bookmarks_file, "a", encoding="utf-8") as f:
-            f.write(f"{uri} | {title}\n")
+            f.write(f"{uri} | {title} | general\n")
         print(f"[wf-view] Bookmarked: {uri}")
 
     def copy_url_to_clipboard(self):
@@ -279,24 +356,48 @@ class WebflowViewer(Gtk.Window):
         try:
             proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
             proc.communicate(input=uri.encode("utf-8"))
-            print(f"[wf-view] Copied URL to clipboard: {uri}")
         except FileNotFoundError:
-            # Fallback to Gtk clipboard
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             clipboard.set_text(uri, -1)
 
+    def sync_workbench_on_exit(self):
+        if not self.wb_manifest or not self.wb_manifest.exists():
+            return
+        try:
+            uri = self.web_view.get_uri() or self.initial_url
+            title = self.web_view.get_title() or uri
+            data = json.loads(self.wb_manifest.read_text(encoding="utf-8"))
+            tabs = data.get("tabs", [])
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            updated = False
+            for t in tabs:
+                if t.get("url") == self.initial_url or t.get("url") == uri:
+                    t["url"] = uri
+                    t["title"] = title
+                    t["updated_at"] = now
+                    updated = True
+                    break
+            if not updated:
+                tabs.append({"url": uri, "title": title, "added_at": now})
+            data["tabs"] = tabs
+            data["updated_at"] = now
+            self.wb_manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     def on_quit(self, *args):
+        self.sync_workbench_on_exit()
         Gtk.main_quit()
         sys.exit(0)
 
 
 def main():
-    if len(sys.argv) < 2:
-        sys.stderr.write("Usage: wf-view <url>\n")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Webflow Tier 3 WebKitGTK Viewer")
+    parser.add_argument("url", help="Target URL")
+    parser.add_argument("--workbench", "-w", default=None, help="Bind to named workbench session")
+    args = parser.parse_args()
 
-    target_url = sys.argv[1].strip()
-    app = WebflowViewer(target_url)
+    app = WebflowViewer(args.url.strip(), workbench=args.workbench)
     Gtk.main()
 
 

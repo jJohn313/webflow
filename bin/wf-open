@@ -14,17 +14,20 @@ import urllib.request
 from pathlib import Path
 
 
+import argparse
+
+
 def load_rules():
+    # Load repo defaults first, then user overrides
     config_paths = [
-        Path.home() / ".config" / "webflow" / "rules.conf",
-        Path(__file__).resolve().parent.parent / "config" / "rules.conf"
+        Path(__file__).resolve().parent.parent / "config" / "rules.conf",
+        Path.home() / ".config" / "webflow" / "rules.conf"
     ]
     tier1_rules = []
     tier3_rules = []
-
-    active_section = None
     for path in config_paths:
         if path.exists():
+            active_section = None
             try:
                 for line in path.read_text(encoding="utf-8").splitlines():
                     line = line.strip()
@@ -36,15 +39,12 @@ def load_rules():
                     elif line == "[TIER3_ONLY]":
                         active_section = "TIER3"
                         continue
-
-                    if active_section == "TIER1":
+                    if active_section == "TIER1" and line not in tier1_rules:
                         tier1_rules.append(line)
-                    elif active_section == "TIER3":
+                    elif active_section == "TIER3" and line not in tier3_rules:
                         tier3_rules.append(line)
-                break
             except Exception as e:
                 sys.stderr.write(f"Warning reading config {path}: {e}\n")
-
     return tier1_rules, tier3_rules
 
 
@@ -142,11 +142,12 @@ def log_history(tier: str, url: str, title: str = ""):
 
 
 def main():
-    if len(sys.argv) < 2:
-        sys.stderr.write("Usage: wf-open <url>\n")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Webflow Dispatcher")
+    parser.add_argument("url", help="Target URL")
+    parser.add_argument("--workbench", "-w", default=None, help="Bind to named workbench session")
+    args = parser.parse_args()
 
-    raw_url = sys.argv[1].strip()
+    raw_url = args.url.strip()
     if not re.match(r"^https?://", raw_url):
         url = "https://" + raw_url
     else:
@@ -164,12 +165,16 @@ def main():
     log_history(chosen_tier, url)
 
     bin_dir = Path(__file__).resolve().parent
-    if chosen_tier == "TIER1":
+    if chosen_tier == "TIER1" and not args.workbench:
         reader_bin = bin_dir / "wf-reader"
         os.execv(str(reader_bin), [str(reader_bin), url])
     else:
         view_bin = bin_dir / "wf-view"
-        os.execv(str(view_bin), [str(view_bin), url])
+        cmd = [str(view_bin)]
+        if args.workbench:
+            cmd.extend(["--workbench", args.workbench])
+        cmd.append(url)
+        os.execv(str(view_bin), cmd)
 
 
 if __name__ == "__main__":

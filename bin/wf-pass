@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-"""
-wf-pass - Active-Window Credential Injector for Webflow
-Synthesizes credentials via wtype into active wf-view window using pass or rbw.
-"""
+# wf-pass - Active-Window Credential Injector for Webflow
 set -euo pipefail
 
-# 1. Detect active window details
 WINDOW_INFO=""
 if command -v hyprctl >/dev/null 2>&1; then
     WINDOW_INFO="$(hyprctl activewindow -j 2>/dev/null || true)"
@@ -13,13 +9,15 @@ fi
 
 DOMAIN=""
 if [[ -n "${WINDOW_INFO}" ]]; then
-    # Parse title or class
-    TITLE=$(echo "${WINDOW_INFO}" | grep -o '"title": "[^"]*"' | cut -d'"' -f4 || true)
-    # Extract domain pattern e.g. domain.com or from wf-view [NORMAL] domain.com
-    DOMAIN=$(echo "${TITLE}" | grep -oE '([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}' | head -n1 || true)
+    TITLE=$(echo "${WINDOW_INFO}" | grep -o '"title": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+    # 1. Try explicit (@domain.com) marker from wf-view
+    DOMAIN=$(echo "${TITLE}" | grep -oE '\(@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\)' | tr -d '(@)' | head -n1 || true)
+    # 2. Fallback to any domain pattern in title
+    if [[ -z "${DOMAIN}" ]]; then
+        DOMAIN=$(echo "${TITLE}" | grep -oE '([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}' | head -n1 || true)
+    fi
 fi
 
-# Fallback: prompt user for domain if not automatically detected
 if [[ -z "${DOMAIN}" ]]; then
     if command -v rofi >/dev/null 2>&1; then
         DOMAIN=$(rofi -dmenu -p "Login domain: " || true)
@@ -38,21 +36,24 @@ echo "[*] Searching credentials for domain: ${DOMAIN}"
 USER=""
 PASS=""
 
-# 2. Try rbw (Bitwarden CLI)
+# Try rbw (Bitwarden CLI)
 if command -v rbw >/dev/null 2>&1 && rbw unlocked >/dev/null 2>&1; then
-    ENTRY_ID=$(rbw search "${DOMAIN}" 2>/dev/null | head -n1 || true)
+    ENTRY_ID=$(rbw list --fields id,name,user 2>/dev/null | grep -i "${DOMAIN}" | head -n1 | cut -f1 || true)
     if [[ -n "${ENTRY_ID}" ]]; then
         USER=$(rbw get --field username "${ENTRY_ID}" 2>/dev/null || true)
-        PASS=$(rbw get "${ENTRY_ID}" 2>/dev/null || true)
+        PASS=$(rbw get "${ENTRY_ID}" 2>/dev/null | head -n1 || true)
     fi
 fi
 
-# 3. Try pass (standard unix password store) if rbw didn't return
+# Try pass (standard unix password store)
 if [[ -z "${PASS}" ]] && command -v pass >/dev/null 2>&1; then
-    PASS_ENTRY=$(pass find "${DOMAIN}" 2>/dev/null | grep -v 'Search terms' | head -n1 | sed 's/^[├── └── ]*//' || true)
+    PASS_ENTRY=$(pass find "${DOMAIN}" 2>/dev/null | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' | grep -v 'Search terms' | grep -v '/$' | head -n1 | sed 's/^[├└─│ ]*//;s/\.gpg$//' || true)
     if [[ -n "${PASS_ENTRY}" ]]; then
-        PASS=$(pass show "${PASS_ENTRY}" 2>/dev/null | head -n1 || true)
-        USER=$(pass show "${PASS_ENTRY}" 2>/dev/null | grep -iE '^(user|username|login):' | cut -d':' -f2- | tr -d ' ' || true)
+        STORE_DIR="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+        FULL_ENTRY=$(find "${STORE_DIR}" -type f -iname "*${DOMAIN}*.gpg" 2>/dev/null | head -n1 | sed "s|^${STORE_DIR}/||;s|\.gpg$||" || true)
+        TARGET_ENTRY="${FULL_ENTRY:-$PASS_ENTRY}"
+        PASS=$(pass show "${TARGET_ENTRY}" 2>/dev/null | head -n1 || true)
+        USER=$(pass show "${TARGET_ENTRY}" 2>/dev/null | grep -iE '^(user|username|login|email):' | head -n1 | cut -d':' -f2- | xargs || true)
     fi
 fi
 
@@ -61,23 +62,16 @@ if [[ -z "${PASS}" ]]; then
     exit 1
 fi
 
-# 4. Inject credentials using wtype
 if ! command -v wtype >/dev/null 2>&1; then
     echo "[-] wtype utility is required for keystroke synthesis."
     exit 1
 fi
 
-echo "[*] Injecting credentials into active window..."
-# Small sleep to ensure window focus has settled
 sleep 0.1
-
 if [[ -n "${USER}" ]]; then
-    wtype -s 20 "${USER}"
+    wtype -s 15 -- "${USER}"
     wtype -k Tab
     sleep 0.05
 fi
-
-wtype -s 20 "${PASS}"
+wtype -s 15 -- "${PASS}"
 wtype -k Return
-
-echo "[✔] Credentials synthesized successfully."

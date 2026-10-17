@@ -123,6 +123,28 @@ class SemanticHTMLToMarkdown(HTMLParser):
         return text, self.title.strip(), self.links
 
 
+def postprocess_markdown_links(md_text: str, base_url: str):
+    """Ensures all Markdown links are indexed with [1..N] for interactive jumping."""
+    links = []
+    counter = 0
+
+    def repl(match):
+        nonlocal counter
+        text = match.group(1).strip()
+        href = match.group(2).strip()
+        if not text or href.startswith("#") or href.startswith("javascript:"):
+            return match.group(0)
+        full_url = urllib.parse.urljoin(base_url, href)
+        counter += 1
+        links.append((counter, text, full_url))
+        return f"[{text}]({full_url}) `[{counter}]`"
+
+    # Avoid duplicate index tags
+    cleaned = re.sub(r' `\[\d+\]`', '', md_text)
+    processed = re.sub(r'\[([^\[\]]+)\]\(([^)\s]+)\)', repl, cleaned)
+    return processed, links
+
+
 def extract_content(url: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Webflow/0.1.0"
@@ -136,15 +158,19 @@ def extract_content(url: str):
         import trafilatura
         extracted = trafilatura.extract(raw_html, include_links=True, output_format="markdown")
         if extracted and len(extracted) > 300:
-            title = trafilatura.core.extract_metadata(raw_html).title or url
-            return extracted, title, []
+            meta = trafilatura.extract_metadata(raw_html)
+            title = (meta.title if meta and meta.title else None) or url
+            md_indexed, links = postprocess_markdown_links(extracted, url)
+            return md_indexed, title, links
     except ImportError:
         pass
 
     # Built-in semantic extractor
     parser = SemanticHTMLToMarkdown(base_url=url)
     parser.feed(raw_html)
-    return parser.get_markdown()
+    raw_md, title, links = parser.get_markdown()
+    md_indexed, links = postprocess_markdown_links(raw_md, url)
+    return md_indexed, title, links
 
 
 def bookmark(url: str, title: str):
@@ -203,6 +229,7 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
     print("Actions:")
     print("  [E]       Escalate to GUI viewer (wf-view)")
     print("  [b]       Bookmark page")
+    print("  [s]       Save clean Markdown to disk")
     print("  [1..N]    Open referenced link number in wf-open")
     print("  [q/Enter] Quit reader")
     print("-" * 60)
@@ -217,6 +244,13 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
         os.execv(str(wf_view_bin), [str(wf_view_bin), url])
     elif choice.lower() == "b":
         bookmark(url, title)
+    elif choice.lower() == "s":
+        save_dir = Path.home() / "Documents" / "Webflow"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
+        target_file = save_dir / f"{safe_title}.md"
+        target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
+        print(f"[✔] Article saved to: {target_file}")
     elif choice.isdigit():
         num = int(choice)
         match = [l for l in links if l[0] == num]
