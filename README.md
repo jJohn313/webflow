@@ -3,9 +3,13 @@
 > **A Non-Chromium, Modular, Terminal-First Web Architecture for Linux (Wayland / Kitty)**  
 > *Under the umbrella of [Terminal Everything Linux (TEL)](https://github.com/jJohn313/terminal-everything-linux).*
 
-[![Status: WIP](https://img.shields.io/badge/Status-WIP-orange.svg)]()
+[![Status: Early WIP](https://img.shields.io/badge/Status-Early%20WIP%20(Pre--Alpha)-orange.svg)]()
 [![Platform: Linux / Wayland](https://img.shields.io/badge/Platform-Arch%20Linux%20%7C%20Wayland-blue.svg)]()
 [![Engine: WebKitGTK](https://img.shields.io/badge/Engine-WebKitGTK%204.1%2F6.0-green.svg)]()
+
+> [!WARNING]
+> **Project Status: Early Work-in-Progress (Pre-Alpha)**  
+> Webflow is currently an early architectural prototype. The foundation, single-process WebKitGTK Wayland canvas, modal event handler, DOM link hints, and terminal extractor are implemented as a working baseline, but active development, dogfooding, and refinement are ongoing.
 
 ---
 
