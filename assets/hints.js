@@ -139,6 +139,11 @@
             }
             notifyHost('set_mode', { mode: 'INSERT' });
         } else {
+            if (window.__wf_hint_new_tab && el.tagName.toLowerCase() === 'a' && el.href) {
+                notifyHost('open_tab', { url: el.href });
+                cleanup();
+                return;
+            }
             el.focus();
             el.click();
         }

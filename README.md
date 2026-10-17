@@ -121,54 +121,57 @@ webflow
 
 ---
 
-## ⌨️ `wf-view` Modal Keyboard Controller
+## ⌨️ `wf-view` Modal Keyboard Controller & Multi-Tab Container
 
-`wf-view` operates as a true Vim-modal Wayland window without URL bars, buttons, or decorative chrome:
+`wf-view` operates as a true Vim-modal Wayland browser with a native `Gtk.Notebook` multi-tab container and built-in Omnibar, without URL bars, buttons, or decorative window chrome:
 
 ### Normal Mode (Default)
 | Key | Action |
 | :--- | :--- |
+| `o` | **Omnibar**: Open quick URL or search prompt in the *current* tab |
+| `O` / `t` | **Omnibar in New Tab**: Open quick URL or search prompt in a *new* tab |
+| `gt` | Switch to **next tab** (Vim style) |
+| `gT` | Switch to **previous tab** (Vim style) |
+| `1gt` .. `9gt` | Jump directly to tab N (or `Alt+1` .. `Alt+9`) |
+| `x` | **Close current tab** (exits app if last tab) |
 | `j` / `k` | Smooth scroll down / up (120px) |
 | `d` / `u` | Half-page scroll down / up |
 | `gg` | Scroll to top of page |
 | `G` | Scroll to bottom of document |
-| `H` | Navigate backward in history (`history.back()`) |
-| `L` | Navigate forward in history (`history.forward()`) |
+| `H` / `L` | Navigate backward / forward in history |
 | `r` / `R` | Reload page / Reload bypassing cache |
 | `/` | In-page text search mode (`n` next, `N` previous) |
 | `+` / `-` / `0` | Zoom in / Zoom out / Reset zoom |
-| `f` | Trigger DOM link hinting engine (`AA`, `AB`, ...) |
+| `f` | Trigger DOM link hinting in current tab |
+| `T` / `F` | Trigger DOM link hinting and **open link in a new tab** |
 | `i` | Enter `INSERT` mode manually |
 | `p` | **Autofill credentials** from Sovereign Vault for current domain |
 | `b` | Bookmark current URL and page title |
 | `y` | Copy current URL to Wayland clipboard (`wl-copy`) |
-| `E` | De-escalate back to Terminal Reader (`wf-reader`) |
-| `q` | Terminate process and release WebKit rendering threads |
+| `m` / `M` | Hand video/stream URL to **Tier 2** (`wf-media` / `mpv`) |
+| `E` / `e` | De-escalate back to Terminal Reader (`wf-reader`) |
+| `q` | Quit browser (closes all tabs and syncs workbench manifest) |
 
-### Insert Mode
-- Triggered automatically when clicking or focusing an `<input>`, `<textarea>`, or content-editable container, or by typing `i`.
-- All keystrokes pass directly to the web page.
-- Press **`Escape`** to blur the active input, restore keyboard sovereignty, and return to **`NORMAL`** mode.
-
-### Link Hinting Mode (`f`)
-- Press `f` to overlay two-letter badges over all visible interactive elements (`<a>`, `<button>`, `<input>`).
-- Type the 2-letter hint to automatically trigger the click or focus the field.
-- Links with `target="_blank"` are automatically intercepted and routed smoothly within the engine.
-- Press `Escape` or `Backspace` to dismiss hints.
+### Insert Mode & Omnibar
+- Triggered automatically when clicking or focusing an `<input>`, `<textarea>`, or content-editable container, or by typing `i`, `o`, or `O`/`t`.
+- Press **`Escape`** to dismiss the omnibar, blur active inputs, restore keyboard sovereignty, and return to **`NORMAL`** mode.
 
 ---
 
-## 📖 `wf-reader` Keybindings & Bidirectional Escalation
+## 📖 `wf-reader` Typeset Reader & Dual-Pane Split View
 
 When reading articles in the terminal:
-- **`e` / `E`**: **Bidirectional Escalation**: Suspends curses, launches `wf-view --from-reader <url>`, and upon closing the GUI (via `q` or `e`/`E`), automatically restores terminal curses mode at the **exact same scroll position** (`scroll_y`).
-- **`j` / `k`** (or `Down` / `Up`): Scroll down / up line-by-line.
-- **`d` / `u`**: Half-page scroll down / up.
-- **`g` / `G`**: Jump to top / bottom of article.
-- **`1..N`**: Jump directly to referenced hyperlink number via `wf-open`.
-- **`s`**: Save rendered Markdown file to `~/Documents/Webflow/<title>.md`.
-- **`b`**: Bookmark page to `bookmarks.txt`.
-- **`q`**: Quit reader.
+* **Centered Typography**: In single-pane mode, content is typeset and centered on screen (~88 columns) with comfortable margins instead of stretching across widescreen terminals.
+* **Side-by-Side Split View (`t` / `Ctrl-a` / `Ctrl-t`)**: Opens a prompt to search or enter a new URL. The current page smoothly slides to the left, the new page opens on the right, separated by a thin vertical divider `│`.
+* **Isolated Pane Scrolling**: `Up` / `Down`, `j` / `k`, `d` / `u` strictly scroll *only* the active or mouse-hovered pane; the other pane's position remains completely fixed.
+* **Mouse Hover & Wheel**: Clicking or hovering the mouse cursor over a pane immediately selects it; mouse wheel scrolls only the hovered pane.
+* **Pane Navigation**:
+  * `Tab` / `Ctrl-w w` / `h` / `l`: Switch active pane between Left and Right.
+  * `x` / `Ctrl-w q`: Close active split pane; remaining pane smoothly slides back to centered view.
+  * `1..N`: Jump to link in current pane (or press `T` to open link in second split pane).
+  * `e` / `E`: **Bidirectional Escalation**: Launches `wf-view --from-reader` with all currently open split URLs as tabs; closing `wf-view` returns directly to your terminal reader with scroll positions preserved.
+  * `s` / `b`: Save Markdown to `~/Documents/Webflow/` or bookmark to `bookmarks.txt`.
+  * `q`: Close active pane (or quit reader if only 1 pane open).
 
 ---
 

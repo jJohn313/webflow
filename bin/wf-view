@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 wf-view - Tier 3: In-House Modal WebKitGTK Browser for Webflow
-High-performance, chromeless, single-process Wayland client with Vim modal navigation.
+High-performance, chromeless, single-process Wayland client with Vim modal navigation,
+multi-tab container (Gtk.Notebook), and built-in Omnibar.
 """
 import os
 import sys
@@ -33,12 +34,12 @@ import gi
 try:
     gi.require_version("WebKit2", "4.1")
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
+    from gi.repository import Gtk, Gdk, GLib, Pango, WebKit2 as WebKit
 except Exception:
     try:
         gi.require_version("WebKit2", "4.0")
         gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
+        from gi.repository import Gtk, Gdk, GLib, Pango, WebKit2 as WebKit
     except Exception as e:
         log_error(f"Error loading WebKit2GTK / GTK 3.0: {e}\nEnsure 'webkit2gtk-4.1' and 'python-gobject' are installed.")
         sys.exit(1)
@@ -62,41 +63,152 @@ def extract_root_domain(url: str) -> str:
     return netloc
 
 
+FOCUS_OBSERVER_JS = """
+(function() {
+    function isEditable(el) {
+        if (!el) return false;
+        var tag = (el.tagName || '').toLowerCase();
+        return el.isContentEditable || tag === 'textarea' ||
+            (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
+    }
+    window.addEventListener('focusin', function(e) {
+        if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+            window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'INSERT'}));
+        }
+    }, true);
+    window.addEventListener('focusout', function(e) {
+        if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+            window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'NORMAL'}));
+        }
+    }, true);
+})();
+"""
+
+
 class WebflowViewer(Gtk.Window):
-    def __init__(self, initial_url: str, workbench: str = None, from_reader: bool = False):
+    def __init__(self, urls: list, workbench: str = None, from_reader: bool = False):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
-        self.initial_url = initial_url if "://" in initial_url else f"https://{initial_url}"
-        self.root_domain = extract_root_domain(self.initial_url)
+        if isinstance(urls, str):
+            urls = [urls]
+        self.initial_urls = [u if "://" in u else f"https://{u}" for u in urls] if urls else ["https://duckduckgo.com"]
         self.workbench = workbench
         self.from_reader = from_reader
         self.mode = "NORMAL"  # NORMAL | INSERT | HINTS | SEARCH
         self.pending_g = False
+        self.pending_number = None
         self.search_text = ""
         self.status_notification = ""
+        self.omnibar_new_tab = False
 
         # Credential Vault & Autofill
         self.vault = WebflowVault()
         self.autofill_script_path = REPO_ROOT / "assets" / "autofill.js"
         self.pending_credentials = None
 
-        # Paths: Always use per-domain session storage so logins persist seamlessly
-        # between Ephemeral mode and Workbenches!
         self.base_share = Path.home() / ".local" / "share" / "webflow"
-        self.session_dir = self.base_share / "sessions" / self.root_domain
+        # Common storage path for engine cache/data/cookies
+        self.storage_dir = self.base_share / "storage"
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
         if self.workbench:
             safe_wb = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.workbench.strip())
             self.wb_manifest = self.base_share / "workbenches" / f"{safe_wb}.json"
         else:
             self.wb_manifest = None
 
-        self.session_dir.mkdir(parents=True, exist_ok=True)
         self.bookmarks_file = self.base_share / "bookmarks.txt"
         self.hints_script_path = REPO_ROOT / "assets" / "hints.js"
 
+        self.setup_css()
         self.setup_window()
         self.setup_engine()
         self.setup_keybindings()
-        self.load_url(self.initial_url)
+
+        # Open initial URLs in tabs
+        for idx, u in enumerate(self.initial_urls):
+            self.create_tab(u, switch_to=(idx == 0))
+
+    @property
+    def current_web_view(self) -> WebKit.WebView:
+        page_num = self.notebook.get_current_page()
+        if page_num >= 0:
+            return self.notebook.get_nth_page(page_num)
+        return None
+
+    @property
+    def root_domain(self) -> str:
+        view = self.current_web_view
+        if view:
+            uri = view.get_uri() or ""
+            if uri:
+                return extract_root_domain(uri)
+        return "webflow"
+
+    @property
+    def find_controller(self):
+        view = self.current_web_view
+        return view.get_find_controller() if view else None
+
+    def setup_css(self):
+        css = b"""
+        window {
+            background-color: #1a1b26;
+        }
+        notebook header {
+            background-color: #16161e;
+            border: none;
+            padding: 3px 6px 0px 6px;
+        }
+        notebook tab {
+            background-color: #1f2335;
+            color: #7aa2f7;
+            border: 1px solid #292e42;
+            padding: 4px 10px;
+            margin-right: 3px;
+            border-radius: 4px 4px 0 0;
+            font-size: 12px;
+        }
+        notebook tab:checked {
+            background-color: #24283b;
+            color: #ebd5b3;
+            border-bottom: 2px solid #ebd5b3;
+            font-weight: bold;
+        }
+        notebook tab button {
+            padding: 0 3px;
+            min-height: 14px;
+            min-width: 14px;
+            color: #565f89;
+            background: transparent;
+            border: none;
+        }
+        notebook tab button:hover {
+            color: #f7768e;
+        }
+        #wf-omnibar {
+            background-color: #1a1b26;
+            padding: 6px 12px;
+            border-bottom: 2px solid #ebd5b3;
+        }
+        #wf-omnibar entry {
+            background-color: #24283b;
+            color: #c0caf5;
+            border: 1px solid #414868;
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-size: 13px;
+            font-family: monospace;
+        }
+        #wf-omnibar entry:focus {
+            border-color: #ebd5b3;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
     def setup_window(self):
         try:
@@ -107,7 +219,6 @@ class WebflowViewer(Gtk.Window):
         self.set_decorated(False)
         self.connect("destroy", self.on_quit)
 
-        # Root vertical layout: InfoBar on top, WebView below
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(self.main_box)
 
@@ -123,60 +234,62 @@ class WebflowViewer(Gtk.Window):
         self.infobar.connect("response", self.on_infobar_response)
         self.main_box.pack_start(self.infobar, False, False, 0)
 
+        # Omnibar overlay
+        self.omnibar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.omnibar_box.set_name("wf-omnibar")
+        self.omnibar_box.set_no_show_all(True)
+        self.omnibar_prompt = Gtk.Label(label=" ➜ Open: ")
+        self.omnibar_entry = Gtk.Entry()
+        self.omnibar_entry.set_hexpand(True)
+        self.omnibar_entry.connect("activate", self.on_omnibar_activate)
+        self.omnibar_entry.connect("key-press-event", self.on_omnibar_key_press)
+        self.omnibar_box.pack_start(self.omnibar_prompt, False, False, 4)
+        self.omnibar_box.pack_start(self.omnibar_entry, True, True, 4)
+        self.main_box.pack_start(self.omnibar_box, False, False, 0)
+
+        # Notebook for multi-tab container
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_scrollable(True)
+        self.notebook.set_show_tabs(True)
+        self.notebook.set_show_border(False)
+        self.notebook.connect("switch-page", self.on_notebook_switch_page)
+        self.main_box.pack_start(self.notebook, True, True, 0)
+
+        self.show_all()
+
     def setup_engine(self):
-        # Safe WebsiteDataManager creation across WebKit2 4.0 / 4.1
         try:
-            data_manager = WebKit.WebsiteDataManager(
-                base_data_directory=str(self.session_dir / "data"),
-                base_cache_directory=str(self.session_dir / "cache")
+            self.data_manager = WebKit.WebsiteDataManager(
+                base_data_directory=str(self.storage_dir / "data"),
+                base_cache_directory=str(self.storage_dir / "cache")
             )
-            web_context = WebKit.WebContext.new_with_website_data_manager(data_manager)
-            cookie_manager = data_manager.get_cookie_manager()
+            self.web_context = WebKit.WebContext.new_with_website_data_manager(self.data_manager)
+            cookie_manager = self.data_manager.get_cookie_manager()
         except Exception:
-            web_context = WebKit.WebContext.get_default()
-            cookie_manager = web_context.get_cookie_manager()
+            self.web_context = WebKit.WebContext.get_default()
+            self.data_manager = self.web_context.get_website_data_manager()
+            cookie_manager = self.web_context.get_cookie_manager()
 
         cookie_manager.set_persistent_storage(
-            str(self.session_dir / "cookies.sqlite"),
+            str(self.storage_dir / "cookies.sqlite"),
             WebKit.CookiePersistentStorage.SQLITE
         )
         cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NO_THIRD_PARTY)
 
-        self.ucm = WebKit.UserContentManager()
-        self.ucm.register_script_message_handler("webflow")
-        self.ucm.connect("script-message-received::webflow", self.on_js_message)
+    def create_tab(self, url: str = None, switch_to: bool = True) -> WebKit.WebView:
+        ucm = WebKit.UserContentManager()
+        ucm.register_script_message_handler("webflow")
+        ucm.connect("script-message-received::webflow", self.on_js_message)
 
-        # Inject focus observer script
-        focus_observer_js = """
-        (function() {
-            function isEditable(el) {
-                if (!el) return false;
-                var tag = (el.tagName || '').toLowerCase();
-                return el.isContentEditable || tag === 'textarea' ||
-                    (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
-            }
-            window.addEventListener('focusin', function(e) {
-                if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
-                    window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'INSERT'}));
-                }
-            }, true);
-            window.addEventListener('focusout', function(e) {
-                if (isEditable(e.target) && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
-                    window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'NORMAL'}));
-                }
-            }, true);
-        })();
-        """
         user_script = WebKit.UserScript.new(
-            focus_observer_js,
+            FOCUS_OBSERVER_JS,
             WebKit.UserContentInjectedFrames.ALL_FRAMES,
             WebKit.UserScriptInjectionTime.END,
             None,
             None
         )
-        self.ucm.add_script(user_script)
+        ucm.add_script(user_script)
 
-        # Inject autofill & credential watcher script
         if self.autofill_script_path.exists():
             autofill_js = self.autofill_script_path.read_text(encoding="utf-8")
             user_script_autofill = WebKit.UserScript.new(
@@ -186,30 +299,135 @@ class WebflowViewer(Gtk.Window):
                 None,
                 None
             )
-            self.ucm.add_script(user_script_autofill)
+            ucm.add_script(user_script_autofill)
 
-        # Create WebView with both context and user_content_manager via GObject
-        self.web_view = GObject_new_webview(web_context, self.ucm)
-
-        settings = self.web_view.get_settings()
+        web_view = GObject_new_webview(self.web_context, ucm)
+        settings = web_view.get_settings()
         settings.set_enable_developer_extras(False)
         settings.set_enable_smooth_scrolling(True)
         settings.set_javascript_can_open_windows_automatically(False)
 
-        # Apply native C++ bytecode adblock, tracker shield, and RAM diet
-        apply_shield_and_ram_diet(web_context, data_manager, self.ucm, settings, self.base_share)
+        apply_shield_and_ram_diet(self.web_context, self.data_manager, ucm, settings, self.base_share)
 
-        self.find_controller = self.web_view.get_find_controller()
+        web_view.connect("notify::title", self.on_title_changed)
+        web_view.connect("notify::uri", self.on_uri_changed)
+        web_view.connect("load-changed", self.on_load_changed)
+        web_view.connect("decide-policy", self.on_decide_policy)
+        web_view.connect("create", self.on_create_web_view)
 
-        self.web_view.connect("notify::title", self.on_title_changed)
-        self.web_view.connect("notify::uri", self.on_uri_changed)
-        self.web_view.connect("load-changed", self.on_load_changed)
-        self.web_view.connect("decide-policy", self.on_decide_policy)
-        self.web_view.connect("create", self.on_create_web_view)
+        # Tab Header Box
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        tab_label = Gtk.Label(label="New Tab")
+        tab_label.set_ellipsize(Pango.EllipsizeMode.END)
+        tab_label.set_max_width_chars(25)
 
-        self.main_box.pack_start(self.web_view, True, True, 0)
-        self.show_all()
+        close_btn = Gtk.Button()
+        close_btn.set_relief(Gtk.ReliefStyle.NONE)
+        close_btn.set_focus_on_click(False)
+        close_icon = Gtk.Label(label="×")
+        close_btn.add(close_icon)
+        close_btn.connect("clicked", lambda b: self.close_tab_for_view(web_view))
+
+        tab_box.pack_start(tab_label, True, True, 0)
+        tab_box.pack_start(close_btn, False, False, 0)
+        tab_box.show_all()
+
+        web_view._tab_label = tab_label
+        web_view._tab_box = tab_box
+
+        page_num = self.notebook.append_page(web_view, tab_box)
+        self.notebook.set_tab_reorderable(web_view, True)
+        web_view.show()
+
+        if url:
+            target = url if "://" in url else f"https://{url}"
+            web_view.load_uri(target)
+
+        if switch_to:
+            self.notebook.set_current_page(page_num)
+            web_view.grab_focus()
+
         self.update_title()
+        return web_view
+
+    def on_notebook_switch_page(self, notebook, page, page_num):
+        GLib.idle_add(self._after_tab_switch, page)
+
+    def _after_tab_switch(self, page):
+        if page:
+            page.grab_focus()
+        self.update_title()
+        self.try_autofill()
+        return False
+
+    def close_tab_for_view(self, view: WebKit.WebView):
+        idx = self.notebook.page_num(view)
+        if idx >= 0:
+            self.close_tab(idx)
+
+    def close_current_tab(self):
+        cur = self.notebook.get_current_page()
+        if cur >= 0:
+            self.close_tab(cur)
+
+    def close_tab(self, page_num: int):
+        view = self.notebook.get_nth_page(page_num)
+        if view:
+            view.stop_loading()
+        self.notebook.remove_page(page_num)
+        if self.notebook.get_n_pages() == 0:
+            self.on_quit()
+        else:
+            self.update_title()
+            cur = self.current_web_view
+            if cur:
+                cur.grab_focus()
+
+    def open_omnibar(self, new_tab: bool = False):
+        self.omnibar_new_tab = new_tab
+        prompt = " ➜ New Tab: " if new_tab else " ➜ Open: "
+        self.omnibar_prompt.set_text(prompt)
+        view = self.current_web_view
+        cur_url = view.get_uri() if (view and not new_tab) else ""
+        self.omnibar_entry.set_text(cur_url or "")
+        self.omnibar_entry.select_region(0, -1)
+        self.omnibar_box.show_all()
+        self.omnibar_entry.grab_focus()
+        self.mode = "INSERT"
+        self.update_title()
+
+    def close_omnibar(self):
+        self.omnibar_box.hide()
+        self.mode = "NORMAL"
+        view = self.current_web_view
+        if view:
+            view.grab_focus()
+        self.update_title()
+
+    def on_omnibar_key_press(self, widget, event):
+        keyname = Gdk.keyval_name(event.keyval)
+        if keyname == "Escape":
+            self.close_omnibar()
+            return True
+        return False
+
+    def on_omnibar_activate(self, entry):
+        text = entry.get_text().strip()
+        if text:
+            if "://" in text:
+                url = text
+            elif "." in text and " " not in text:
+                url = f"https://{text}"
+            else:
+                url = f"https://duckduckgo.com/lite/?q={urllib.parse.quote_plus(text)}"
+
+            if getattr(self, "omnibar_new_tab", False):
+                self.create_tab(url, switch_to=True)
+            else:
+                view = self.current_web_view
+                if view:
+                    view.load_uri(url)
+        self.close_omnibar()
 
     def on_load_changed(self, view, load_event):
         if load_event == WebKit.LoadEvent.FINISHED:
@@ -217,9 +435,8 @@ class WebflowViewer(Gtk.Window):
 
     def on_create_web_view(self, web_view, navigation_action):
         req = navigation_action.get_request()
-        if req and req.get_uri():
-            self.web_view.load_uri(req.get_uri())
-        return None
+        url = req.get_uri() if req else None
+        return self.create_tab(url, switch_to=True)
 
     def is_video_stream_url(self, url: str) -> bool:
         if not url:
@@ -247,15 +464,17 @@ class WebflowViewer(Gtk.Window):
                 subprocess.Popen([str(wf_media), uri], start_new_session=True)
                 self.set_status_notification("🎬 Handed video to wf-media (mpv)")
                 decision.ignore()
-                if uri == self.initial_url or not self.web_view.get_uri():
+                if self.notebook.get_n_pages() <= 1 and (not web_view.get_uri() or uri == web_view.get_uri()):
                     GLib.idle_add(self.on_quit)
+                elif not web_view.get_uri():
+                    self.close_tab_for_view(web_view)
                 return True
 
         if decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
             nav_action = decision.get_navigation_action()
             req = nav_action.get_request()
             if req and req.get_uri():
-                self.web_view.load_uri(req.get_uri())
+                self.create_tab(req.get_uri(), switch_to=True)
             decision.ignore()
             return True
         return False
@@ -298,29 +517,39 @@ class WebflowViewer(Gtk.Window):
         self.pending_credentials = None
         self.infobar.hide()
 
-    def eval_js(self, script: str):
-        if hasattr(self.web_view, "evaluate_javascript"):
-            self.web_view.evaluate_javascript(script, -1, None, None, None, None, None)
+    def eval_js(self, script: str, view: WebKit.WebView = None):
+        target = view or self.current_web_view
+        if not target:
+            return
+        if hasattr(target, "evaluate_javascript"):
+            target.evaluate_javascript(script, -1, None, None, None, None, None)
         else:
-            self.web_view.run_javascript(script, None, None, None)
-
-    def load_url(self, url: str):
-        self.web_view.load_uri(url)
+            target.run_javascript(script, None, None, None)
 
     def update_title(self):
-        page_title = self.web_view.get_title() or self.root_domain
+        view = self.current_web_view
+        page_title = (view.get_title() if view else "") or self.root_domain
         wb_tag = f" [WB:{self.workbench}]" if self.workbench else ""
         reader_tag = " [READER-SYNC]" if self.from_reader else ""
         search_tag = f" [/{self.search_text}]" if self.mode == "SEARCH" else ""
         notif_tag = f" [{self.status_notification}]" if self.status_notification else ""
-        self.set_title(f"wf-view [{self.mode}]{wb_tag}{reader_tag}{search_tag}{notif_tag} (@{self.root_domain}) - {page_title}")
+
+        cur_tab = self.notebook.get_current_page() + 1
+        total_tabs = self.notebook.get_n_pages()
+        tab_tag = f" [{cur_tab}/{total_tabs}]" if total_tabs > 1 else ""
+
+        self.set_title(f"wf-view [{self.mode}]{tab_tag}{wb_tag}{reader_tag}{search_tag}{notif_tag} (@{self.root_domain}) - {page_title}")
 
     def on_title_changed(self, view, param):
-        self.update_title()
-        page_title = self.web_view.get_title()
-        uri = self.web_view.get_uri()
-        if page_title and uri:
-            self.update_history_title(uri, page_title)
+        title = view.get_title() or view.get_uri() or "Tab"
+        if hasattr(view, "_tab_label"):
+            view._tab_label.set_text(title[:25])
+            view._tab_label.set_tooltip_text(title)
+        if view == self.current_web_view:
+            self.update_title()
+            uri = view.get_uri()
+            if title and uri:
+                self.update_history_title(uri, title)
 
     def update_history_title(self, uri: str, title: str):
         hist_jsonl = self.base_share / "history.jsonl"
@@ -339,11 +568,8 @@ class WebflowViewer(Gtk.Window):
             pass
 
     def on_uri_changed(self, view, param):
-        uri = self.web_view.get_uri() or ""
-        new_domain = extract_root_domain(uri)
-        if new_domain != self.root_domain:
-            self.root_domain = new_domain
-        self.update_title()
+        if view == self.current_web_view:
+            self.update_title()
 
     def on_js_message(self, manager, js_result):
         try:
@@ -360,6 +586,10 @@ class WebflowViewer(Gtk.Window):
                 if self.mode == "HINTS":
                     self.mode = "NORMAL"
                     self.update_title()
+            elif action == "open_tab":
+                target_url = data.get("url")
+                if target_url:
+                    self.create_tab(target_url, switch_to=True)
             elif action == "request_autofill":
                 dom = data.get("domain") or self.root_domain
                 self.try_autofill(dom)
@@ -394,9 +624,14 @@ class WebflowViewer(Gtk.Window):
                 return True
 
         if keyname == "Escape":
+            if self.omnibar_box.get_visible():
+                self.close_omnibar()
+                return True
             self.mode = "NORMAL"
             self.pending_g = False
-            self.find_controller.search_finish()
+            self.pending_number = None
+            if self.find_controller:
+                self.find_controller.search_finish()
             self.eval_js(
                 "if (document.activeElement) document.activeElement.blur(); "
                 "if (window.__wf_cleanup_hints) window.__wf_cleanup_hints();"
@@ -404,10 +639,17 @@ class WebflowViewer(Gtk.Window):
             self.update_title()
             return True
 
+        # Alt+1..9 for direct tab switching
+        if (event.state & Gdk.ModifierType.MOD1_MASK) and keyname in "123456789":
+            target = int(keyname) - 1
+            if target < self.notebook.get_n_pages():
+                self.notebook.set_current_page(target)
+            return True
+
         if self.mode == "SEARCH":
             if keyname in ("Return", "KP_Enter"):
                 self.mode = "NORMAL"
-                if self.search_text:
+                if self.search_text and self.find_controller:
                     self.find_controller.search(
                         self.search_text,
                         WebKit.FindOptions.CASE_INSENSITIVE | WebKit.FindOptions.WRAP_AROUND,
@@ -428,6 +670,50 @@ class WebflowViewer(Gtk.Window):
         if self.mode in ("INSERT", "HINTS"):
             return False
 
+        # Vim Tab switching: gt (next), gT (prev), 1..9gt (tab N)
+        if self.pending_g:
+            if keyname == "t":
+                if self.pending_number is not None:
+                    target = max(0, min(self.notebook.get_n_pages() - 1, self.pending_number - 1))
+                    self.notebook.set_current_page(target)
+                    self.pending_number = None
+                else:
+                    cur = self.notebook.get_current_page()
+                    total = self.notebook.get_n_pages()
+                    if total > 1:
+                        self.notebook.set_current_page((cur + 1) % total)
+                self.pending_g = False
+                return True
+            elif keyname == "T":
+                cur = self.notebook.get_current_page()
+                total = self.notebook.get_n_pages()
+                if total > 1:
+                    self.notebook.set_current_page((cur - 1) % total)
+                self.pending_g = False
+                self.pending_number = None
+                return True
+            elif keyname == "g":
+                self.eval_js("window.scrollTo({top: 0, behavior: 'smooth'});")
+                self.pending_g = False
+                self.pending_number = None
+                return True
+            else:
+                self.pending_g = False
+                self.pending_number = None
+
+        if keyname in "123456789":
+            self.pending_number = int(keyname)
+            # Give a brief window to press 'g' 't'
+            return True
+
+        if keyname == "g":
+            self.pending_g = True
+            return True
+
+        view = self.current_web_view
+        if not view:
+            return False
+
         if keyname == "j":
             self.eval_js("window.scrollBy({top: 120, behavior: 'smooth'});")
             return True
@@ -440,29 +726,31 @@ class WebflowViewer(Gtk.Window):
         elif keyname == "u":
             self.eval_js("window.scrollBy({top: -window.innerHeight * 0.5, behavior: 'smooth'});")
             return True
-        elif keyname == "g":
-            if self.pending_g:
-                self.eval_js("window.scrollTo({top: 0, behavior: 'smooth'});")
-                self.pending_g = False
-            else:
-                self.pending_g = True
-            return True
         elif keyname == "G":
             self.eval_js("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
             return True
         elif keyname == "H":
-            if self.web_view.can_go_back():
-                self.web_view.go_back()
+            if view.can_go_back():
+                view.go_back()
             return True
         elif keyname == "L":
-            if self.web_view.can_go_forward():
-                self.web_view.go_forward()
+            if view.can_go_forward():
+                view.go_forward()
             return True
         elif keyname == "r":
-            self.web_view.reload()
+            view.reload()
             return True
         elif keyname == "R":
-            self.web_view.reload_bypass_cache()
+            view.reload_bypass_cache()
+            return True
+        elif keyname == "o":
+            self.open_omnibar(new_tab=False)
+            return True
+        elif keyname in ("O", "t"):
+            self.open_omnibar(new_tab=True)
+            return True
+        elif keyname == "x":
+            self.close_current_tab()
             return True
         elif keyname == "slash":
             self.mode = "SEARCH"
@@ -470,27 +758,27 @@ class WebflowViewer(Gtk.Window):
             self.update_title()
             return True
         elif keyname == "n":
-            if self.search_text:
+            if self.search_text and self.find_controller:
                 self.find_controller.search_next()
             return True
         elif keyname == "N":
-            if self.search_text:
+            if self.search_text and self.find_controller:
                 self.find_controller.search_previous()
             return True
         elif keyname in ("plus", "equal"):
-            self.web_view.set_zoom_level(self.web_view.get_zoom_level() + 0.1)
+            view.set_zoom_level(view.get_zoom_level() + 0.1)
             return True
         elif keyname == "minus":
-            self.web_view.set_zoom_level(max(0.3, self.web_view.get_zoom_level() - 0.1))
+            view.set_zoom_level(max(0.3, view.get_zoom_level() - 0.1))
             return True
         elif keyname == "0":
-            self.web_view.set_zoom_level(1.0)
+            view.set_zoom_level(1.0)
             return True
         elif keyname in ("E", "e"):
             if self.from_reader:
                 self.on_quit()
                 return True
-            uri = self.web_view.get_uri() or self.initial_url
+            uri = view.get_uri() or self.initial_urls[0]
             wf_reader = Path(__file__).resolve().parent / "wf-reader"
             subprocess.Popen(["kitty", "-e", str(wf_reader), uri])
             self.on_quit()
@@ -509,7 +797,10 @@ class WebflowViewer(Gtk.Window):
             self.update_title()
             return True
         elif keyname == "f":
-            self.trigger_hints()
+            self.trigger_hints(new_tab=False)
+            return True
+        elif keyname in ("T", "F"):
+            self.trigger_hints(new_tab=True)
             return True
         elif keyname == "p":
             creds = self.vault.get_credentials(self.root_domain)
@@ -524,77 +815,78 @@ class WebflowViewer(Gtk.Window):
             self.eval_js("if (window.__wf_capture_credentials) window.__wf_capture_credentials();")
             return True
         elif keyname in ("M", "m"):
-            uri = self.web_view.get_uri() or self.initial_url
+            uri = view.get_uri() or self.initial_urls[0]
             wf_media = REPO_ROOT / "bin" / "wf-media"
             subprocess.Popen([str(wf_media), uri], start_new_session=True)
             self.set_status_notification("🎬 Launched in wf-media (mpv)")
             return True
 
         self.pending_g = False
+        self.pending_number = None
         return False
 
-    def trigger_hints(self):
+    def trigger_hints(self, new_tab: bool = False):
         if not self.hints_script_path.exists():
             return
         try:
             hints_js = self.hints_script_path.read_text(encoding="utf-8")
             self.mode = "HINTS"
             self.update_title()
-            self.eval_js(hints_js)
+            prefix = f"window.__wf_hint_new_tab = {'true' if new_tab else 'false'}; "
+            self.eval_js(prefix + hints_js)
         except Exception as e:
             log_error(f"Failed to inject hints: {e}")
 
     def bookmark_current(self):
-        uri = self.web_view.get_uri() or self.initial_url
-        title = self.web_view.get_title() or self.root_domain
+        view = self.current_web_view
+        uri = (view.get_uri() if view else "") or self.initial_urls[0]
+        title = (view.get_title() if view else "") or self.root_domain
         self.bookmarks_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.bookmarks_file, "a", encoding="utf-8") as f:
             f.write(f"{uri} | {title} | general\n")
+        self.set_status_notification("★ Bookmarked current tab")
 
     def copy_url_to_clipboard(self):
-        uri = self.web_view.get_uri() or self.initial_url
+        view = self.current_web_view
+        uri = (view.get_uri() if view else "") or self.initial_urls[0]
         try:
             proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
             proc.communicate(input=uri.encode("utf-8"))
         except FileNotFoundError:
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             clipboard.set_text(uri, -1)
+        self.set_status_notification("📋 Copied URL to clipboard")
 
     def sync_workbench_on_exit(self):
         if not self.wb_manifest or not self.wb_manifest.exists():
             return
         try:
-            uri = self.web_view.get_uri() or self.initial_url
-            title = self.web_view.get_title() or uri
-            data = json.loads(self.wb_manifest.read_text(encoding="utf-8"))
-            tabs = data.get("tabs", [])
             now = time.strftime("%Y-%m-%d %H:%M:%S")
-            updated = False
-            for t in tabs:
-                if t.get("url") == self.initial_url or t.get("url") == uri:
-                    t["url"] = uri
-                    t["title"] = title
-                    t["updated_at"] = now
-                    updated = True
-                    break
-            if not updated:
-                tabs.append({"url": uri, "title": title, "added_at": now})
-            data["tabs"] = tabs
-            data["updated_at"] = now
-            self.wb_manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tabs = []
+            for i in range(self.notebook.get_n_pages()):
+                view = self.notebook.get_nth_page(i)
+                uri = view.get_uri()
+                title = view.get_title() or uri
+                if uri:
+                    tabs.append({"url": uri, "title": title, "updated_at": now})
+            if tabs:
+                data = json.loads(self.wb_manifest.read_text(encoding="utf-8"))
+                data["tabs"] = tabs
+                data["updated_at"] = now
+                self.wb_manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
 
     def purge_non_essential_data(self):
         try:
-            dm = self.web_view.get_context().get_website_data_manager()
-            purge_types = (
-                WebKit.WebsiteDataTypes.DISK_CACHE |
-                WebKit.WebsiteDataTypes.MEMORY_CACHE |
-                WebKit.WebsiteDataTypes.OFFLINE_APPLICATION_CACHE |
-                WebKit.WebsiteDataTypes.SERVICE_WORKER_REGISTRATIONS
-            )
-            dm.clear(purge_types, 0, None, None, None)
+            if hasattr(self, "data_manager") and self.data_manager:
+                purge_types = (
+                    WebKit.WebsiteDataTypes.DISK_CACHE |
+                    WebKit.WebsiteDataTypes.MEMORY_CACHE |
+                    WebKit.WebsiteDataTypes.OFFLINE_APPLICATION_CACHE |
+                    WebKit.WebsiteDataTypes.SERVICE_WORKER_REGISTRATIONS
+                )
+                self.data_manager.clear(purge_types, 0, None, None, None)
         except Exception:
             pass
 
@@ -616,13 +908,13 @@ def GObject_new_webview(web_context, ucm):
 
 def main():
     parser = argparse.ArgumentParser(description="Webflow Tier 3 WebKitGTK Viewer")
-    parser.add_argument("url", help="Target URL")
+    parser.add_argument("urls", nargs="+", help="Target URL(s) to open as tabs")
     parser.add_argument("--workbench", "-w", default=None, help="Bind to named workbench session")
     parser.add_argument("--from-reader", action="store_true", help="Escalated from interactive terminal reader")
     args = parser.parse_args()
 
     try:
-        app = WebflowViewer(args.url.strip(), workbench=args.workbench, from_reader=args.from_reader)
+        app = WebflowViewer(args.urls, workbench=args.workbench, from_reader=args.from_reader)
         Gtk.main()
     except Exception:
         log_error(traceback.format_exc())

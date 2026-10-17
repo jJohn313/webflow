@@ -2,6 +2,8 @@
 """
 wf-reader - Tier 1: Terminal Markdown Extractor & Typeset Terminal Reader for Webflow
 Extracts semantic text from web pages into clean Markdown and renders formatted ANSI typography.
+Features centered single-page layout, dual-pane side-by-side split view, isolated pane scrolling,
+and mouse hover/scroll support.
 """
 import os
 import sys
@@ -100,67 +102,52 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.output.append("\n\n```\n")
         elif tag_lower == "a":
             href = attrs_dict.get("href", "")
-            if href and not href.startswith(("#", "javascript:", "mailto:")):
+            if href and not href.startswith(("#", "javascript:")):
                 self.current_href = urllib.parse.urljoin(self.base_url, href)
                 self.current_link_text = []
 
+        if not is_void:
+            self.ignore_stack.append(tag_lower)
+
     def handle_endtag(self, tag):
         tag_lower = tag.lower()
-        if tag_lower in VOID_TAGS:
-            return
-
-        if self.ignore_stack:
-            # Pop matching tag or top of stack safely
-            if tag_lower in self.ignore_stack:
-                while self.ignore_stack:
-                    popped = self.ignore_stack.pop()
-                    if popped == tag_lower:
-                        break
-            else:
-                self.ignore_stack.pop()
-            return
+        if self.ignore_stack and self.ignore_stack[-1] == tag_lower:
+            self.ignore_stack.pop()
 
         if tag_lower == "title":
             self.in_title = False
-        elif tag_lower in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-            self.output.append("\n\n")
+        elif tag_lower == "pre":
+            self.in_pre = False
+            self.output.append("\n```\n\n")
         elif tag_lower in ["strong", "b"]:
             self.output.append("** ")
         elif tag_lower in ["em", "i"]:
             self.output.append("* ")
         elif tag_lower == "code" and not self.in_pre:
             self.output.append("` ")
-        elif tag_lower == "pre":
-            self.in_pre = False
-            self.output.append("\n```\n\n")
         elif tag_lower == "a" and self.current_href:
-            link_text = " ".join("".join(self.current_link_text).split()).strip()
-            if link_text and not re.match(r"^\[?\d+\]?$", link_text) and link_text.lower() not in ("edit", "edit source"):
+            link_text = "".join(self.current_link_text).strip()
+            if link_text:
                 self.output.append(f" [{link_text}]({self.current_href}) ")
-            elif link_text:
-                self.output.append(f" {link_text} ")
             self.current_href = None
             self.current_link_text = []
 
     def handle_data(self, data):
-        if self.ignore_stack:
+        if self.ignore_stack and self.ignore_stack[-1] in self.ignored_tags:
             return
         if self.in_title:
             self.title += data
             return
-        if not self.in_pre:
-            data = re.sub(r"\s+", " ", data)
         if self.current_href is not None:
             self.current_link_text.append(data)
-        else:
-            self.output.append(data)
+        self.output.append(data)
 
     def get_markdown(self):
-        text = "".join(self.output)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n[ \t]+", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text, self.title.strip()
+        raw = "".join(self.output)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        lines = [line.strip() for line in raw.splitlines()]
+        clean = "\n".join(lines).strip()
+        return clean, self.title.strip()
 
 
 def format_links_for_reading(md_text: str, base_url: str):
@@ -185,10 +172,9 @@ def format_links_for_reading(md_text: str, base_url: str):
     return processed, links
 
 
-def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> str:
-    term_w = shutil.get_terminal_size((100, 30)).columns
-    width = min(88, max(60, term_w - 8))
-    pad = "    "
+def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list, width: int = 80) -> str:
+    width = max(35, width)
+    pad = ""
 
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -209,8 +195,9 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
     out = []
     out.append("")
     out.append(f"{pad}{BOLD}{CYAN}┏{'━' * (width - 2)}┓{RESET}")
-    for t_line in textwrap.wrap(title, width=width - 6) or [title]:
-        out.append(f"{pad}{BOLD}{CYAN}┃{RESET}  {BOLD}{t_line.ljust(width - 6)}{RESET}  {BOLD}{CYAN}┃{RESET}")
+    wrap_w = max(10, width - 6)
+    for t_line in textwrap.wrap(title, width=wrap_w) or [title]:
+        out.append(f"{pad}{BOLD}{CYAN}┃{RESET}  {BOLD}{t_line.ljust(wrap_w)}{RESET}  {BOLD}{CYAN}┃{RESET}")
     out.append(f"{pad}{BOLD}{CYAN}┗{'━' * (width - 2)}┛{RESET}")
     out.append(f"{pad}{DIM}Source: {url}{RESET}")
     out.append(f"{pad}{DIM}{'─' * width}{RESET}\n")
@@ -224,12 +211,12 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
 
         if block.startswith("```"):
             lines = block.splitlines()
-            out.append(f"{pad}{DIM}┌── code {'─' * (width - 10)}┐{RESET}")
+            out.append(f"{pad}{DIM}┌── code {'─' * max(2, width - 10)}┐{RESET}")
             for cl in lines[1:]:
                 if cl.strip() == "```":
                     continue
-                out.append(f"{pad}{DIM}│{RESET} {MAGENTA}{cl}{RESET}")
-            out.append(f"{pad}{DIM}└{'─' * (width - 2)}┘{RESET}\n")
+                out.append(f"{pad}{DIM}│{RESET} {MAGENTA}{cl[:width - 4]}{RESET}")
+            out.append(f"{pad}{DIM}└{'─' * max(2, width - 2)}┘{RESET}\n")
             continue
 
         if block.startswith("#"):
@@ -256,7 +243,7 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
                 item_clean = re.sub(r"^[\*\-]\s+", "", item.strip())
                 if not item_clean:
                     continue
-                wrapped = textwrap.wrap(item_clean, width=width - 4)
+                wrapped = textwrap.wrap(item_clean, width=max(10, width - 4))
                 for idx, wline in enumerate(wrapped):
                     prefix = f"{pad}  {CYAN}•{RESET} " if idx == 0 else f"{pad}    "
                     out.append(prefix + style_inline(wline))
@@ -265,7 +252,7 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
 
         if block.startswith(">"):
             q_clean = re.sub(r"^>\s*", "", block, flags=re.MULTILINE)
-            for wline in textwrap.wrap(q_clean, width=width - 4):
+            for wline in textwrap.wrap(q_clean, width=max(10, width - 4)):
                 out.append(f"{pad}{YELLOW}│{RESET} {ITALIC}{style_inline(wline)}{RESET}")
             out.append("")
             continue
@@ -279,9 +266,9 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
         out.append(f"\n{pad}{BOLD}{CYAN}▌ Hyperlink Reference Index (Type 1..{len(links)}){RESET}")
         out.append(f"{pad}{DIM}{'─' * width}{RESET}")
         for num, ltext, lurl in links[:60]:
-            short_t = (ltext[:32] + "…") if len(ltext) > 33 else ltext
-            short_u = (lurl[:width - 42] + "…") if len(lurl) > (width - 41) else lurl
-            out.append(f"{pad}{YELLOW}[{num:2d}]{RESET} {BOLD}{short_t:<34}{RESET} {DIM}{short_u}{RESET}")
+            short_t = (ltext[:24] + "…") if len(ltext) > 25 else ltext
+            short_u = (lurl[:max(10, width - 36)] + "…") if len(lurl) > max(10, width - 35) else lurl
+            out.append(f"{pad}{YELLOW}[{num:2d}]{RESET} {BOLD}{short_t:<26}{RESET} {DIM}{short_u}{RESET}")
         if len(links) > 60:
             out.append(f"{pad}{DIM}... and {len(links) - 60} more links.{RESET}")
         out.append("")
@@ -289,8 +276,29 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
     return "\n".join(out)
 
 
+def resolve_url_or_search(query: str) -> str:
+    query = query.strip()
+    if not query:
+        return None
+    if "://" in query:
+        return query
+    if "." in query and " " not in query:
+        return f"https://{query}"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            html_text = resp.read().decode("utf-8", errors="replace")
+        links = re.findall(r'<a[^>]+href=[\'\"](https?://[^\'\"]+)[\'\"][^>]*class=[\'\"]result-link[\'\"]', html_text)
+        if links:
+            return links[0]
+    except Exception:
+        pass
+    return f"https://duckduckgo.com/lite/?q={urllib.parse.quote_plus(query)}"
+
+
 def extract_content(url: str):
-    # Redirect bare www.wikipedia.org splash portal to English Main_Page
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc in ("www.wikipedia.org", "wikipedia.org") and parsed.path in ("", "/"):
         url = "https://en.wikipedia.org/wiki/Main_Page"
@@ -336,7 +344,6 @@ def extract_content(url: str):
     parser.feed(body_html)
     raw_md, parsed_title = parser.get_markdown()
 
-    # Fallback: if page is a link hub / portal with very little prose, re-parse keeping nav links
     if len(raw_md) < 200:
         parser2 = SemanticHTMLToMarkdown(base_url=url, keep_nav_links=True)
         parser2.feed(raw_html)
@@ -352,13 +359,11 @@ def bookmark(url: str, title: str):
     bm_file.parent.mkdir(parents=True, exist_ok=True)
     with open(bm_file, "a", encoding="utf-8") as f:
         f.write(f"{url} | {title} | general\n")
-    print(f"\n[+] Bookmarked: {url} | {title}")
 
 
 ANSI_SPLIT_RE = re.compile(r"(\033\[[0-9;]*m)")
 
 def parse_ansi_line(line: str):
-    """Converts ANSI escape codes from render_markdown_to_ansi into curses attributes."""
     segments = []
     attr = curses.A_NORMAL
     parts = ANSI_SPLIT_RE.split(line)
@@ -388,17 +393,29 @@ def parse_ansi_line(line: str):
     return segments
 
 
-def run_interactive_reader(url: str, title: str, md_text: str, links: list):
-    ansi_doc = render_markdown_to_ansi(title, url, md_text, links)
-    raw_lines = ansi_doc.splitlines()
+def ensure_buffer_rendered(buf, width):
+    if buf.get("rendered_width") != width:
+        ansi_text = render_markdown_to_ansi(buf["title"], buf["url"], buf["md_text"], buf["links"], width=width)
+        buf["parsed_lines"] = [parse_ansi_line(l) for l in ansi_text.splitlines()]
+        buf["rendered_width"] = width
 
-    action_After = {"type": None, "payload": None}
+
+def run_interactive_reader(initial_buffers: list):
+    buffers = initial_buffers
+    active_pane = 0
 
     def _curses_reader(stdscr):
+        nonlocal active_pane, buffers
         try:
             curses.curs_set(0)
         except curses.error:
             pass
+
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except Exception:
+            pass
+
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
@@ -408,49 +425,153 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
             curses.init_pair(4, curses.COLOR_MAGENTA, -1)
             curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
-        parsed_lines = [parse_ansi_line(l) for l in raw_lines]
-        scroll_y = 0  # ALWAYS starts at top of document (line 0)
         link_buf = ""
+        link_open_split = False
+        split_prompt = False
+        split_buf = ""
         status_note = ""
 
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            view_h = max(1, h - 2)
-            max_scroll = max(0, len(parsed_lines) - view_h)
-            scroll_y = max(0, min(scroll_y, max_scroll))
+            view_h = max(1, h - 3)
 
-            # Render visible lines from scroll_y
-            for row_idx in range(view_h):
-                line_idx = scroll_y + row_idx
-                if line_idx >= len(parsed_lines):
-                    break
-                x = 0
-                for text_seg, attr in parsed_lines[line_idx]:
-                    if x >= w - 1:
+            if len(buffers) == 1:
+                active_pane = 0
+                buf = buffers[0]
+                col_w = min(88, max(45, w - 8))
+                margin_left = max(0, (w - col_w) // 2)
+                ensure_buffer_rendered(buf, col_w)
+
+                max_scroll = max(0, len(buf["parsed_lines"]) - view_h)
+                buf["scroll_y"] = max(0, min(buf["scroll_y"], max_scroll))
+                pct = int((buf["scroll_y"] / max_scroll) * 100) if max_scroll > 0 else 100
+                pos_label = "TOP" if buf["scroll_y"] == 0 else ("BOT" if buf["scroll_y"] >= max_scroll else f"{pct:2d}%")
+
+                top_bar = f" 📖 {buf['title'][:col_w - 14]} [{pos_label}] "
+                try:
+                    stdscr.addstr(0, margin_left, top_bar.ljust(col_w)[:col_w], curses.color_pair(5) | curses.A_BOLD)
+                except curses.error:
+                    pass
+
+                for r in range(view_h):
+                    line_idx = buf["scroll_y"] + r
+                    if line_idx >= len(buf["parsed_lines"]):
                         break
-                    clipped = text_seg[: max(0, w - 1 - x)]
+                    x = 0
+                    for text_seg, attr in buf["parsed_lines"][line_idx]:
+                        if x >= col_w:
+                            break
+                        clipped = text_seg[: max(0, col_w - x)]
+                        try:
+                            stdscr.addstr(r + 1, margin_left + x, clipped, attr)
+                        except curses.error:
+                            pass
+                        x += len(clipped)
+
+            else:
+                pane_w = (w - 1) // 2
+
+                # Left Pane (Pane 0)
+                buf0 = buffers[0]
+                col_w0 = max(25, pane_w - 4)
+                ensure_buffer_rendered(buf0, col_w0)
+                max_scroll0 = max(0, len(buf0["parsed_lines"]) - view_h)
+                buf0["scroll_y"] = max(0, min(buf0["scroll_y"], max_scroll0))
+                pct0 = int((buf0["scroll_y"] / max_scroll0) * 100) if max_scroll0 > 0 else 100
+                pos0 = "TOP" if buf0["scroll_y"] == 0 else ("BOT" if buf0["scroll_y"] >= max_scroll0 else f"{pct0:2d}%")
+
+                is_act0 = (active_pane == 0)
+                tag0 = " [ACTIVE] " if is_act0 else " "
+                style0 = (curses.color_pair(5) | curses.A_BOLD) if is_act0 else (curses.color_pair(1) | curses.A_DIM)
+                banner0 = f" [1/2]{tag0}{buf0['title'][:pane_w - 18]} [{pos0}] "
+                try:
+                    stdscr.addstr(0, 0, banner0.ljust(pane_w)[:pane_w], style0)
+                except curses.error:
+                    pass
+
+                for r in range(view_h):
+                    line_idx = buf0["scroll_y"] + r
+                    if line_idx >= len(buf0["parsed_lines"]):
+                        break
+                    x = 0
+                    for text_seg, attr in buf0["parsed_lines"][line_idx]:
+                        if x >= col_w0:
+                            break
+                        clipped = text_seg[: max(0, col_w0 - x)]
+                        try:
+                            stdscr.addstr(r + 1, 2 + x, clipped, attr)
+                        except curses.error:
+                            pass
+                        x += len(clipped)
+
+                # Vertical Divider line
+                div_attr = curses.color_pair(1) | curses.A_DIM
+                for r in range(0, view_h + 1):
                     try:
-                        stdscr.addstr(row_idx, x, clipped, attr)
+                        stdscr.addstr(r, pane_w, "│", div_attr)
                     except curses.error:
                         pass
-                    x += len(clipped)
 
-            # Top/Bottom progress percentage
-            pct = int((scroll_y / max_scroll) * 100) if max_scroll > 0 else 100
-            pos_label = "TOP" if scroll_y == 0 else ("BOT" if scroll_y >= max_scroll else f"{pct:2d}%")
+                # Right Pane (Pane 1)
+                buf1 = buffers[1]
+                right_w = w - pane_w - 1
+                col_w1 = max(25, right_w - 4)
+                ensure_buffer_rendered(buf1, col_w1)
+                max_scroll1 = max(0, len(buf1["parsed_lines"]) - view_h)
+                buf1["scroll_y"] = max(0, min(buf1["scroll_y"], max_scroll1))
+                pct1 = int((buf1["scroll_y"] / max_scroll1) * 100) if max_scroll1 > 0 else 100
+                pos1 = "TOP" if buf1["scroll_y"] == 0 else ("BOT" if buf1["scroll_y"] >= max_scroll1 else f"{pct1:2d}%")
 
-            # Status & Action Bar at bottom
-            bar1 = f" 📖 {title[:w-25]} ".ljust(w - 12) + f" [{pos_label}] "
-            if link_buf:
-                bar2 = f" Follow Link #{link_buf}_  (Press Enter to open, Esc to cancel)"
+                is_act1 = (active_pane == 1)
+                tag1 = " [ACTIVE] " if is_act1 else " "
+                style1 = (curses.color_pair(5) | curses.A_BOLD) if is_act1 else (curses.color_pair(1) | curses.A_DIM)
+                banner1 = f" [2/2]{tag1}{buf1['title'][:right_w - 18]} [{pos1}] "
+                try:
+                    stdscr.addstr(0, pane_w + 1, banner1.ljust(right_w)[:right_w], style1)
+                except curses.error:
+                    pass
+
+                for r in range(view_h):
+                    line_idx = buf1["scroll_y"] + r
+                    if line_idx >= len(buf1["parsed_lines"]):
+                        break
+                    x = 0
+                    for text_seg, attr in buf1["parsed_lines"][line_idx]:
+                        if x >= col_w1:
+                            break
+                        clipped = text_seg[: max(0, col_w1 - x)]
+                        try:
+                            stdscr.addstr(r + 1, pane_w + 2 + x, clipped, attr)
+                        except curses.error:
+                            pass
+                        x += len(clipped)
+
+            # Bottom Status & Action Bar
+            if split_prompt:
+                bar1 = f" ➜ Open in split (URL / search): {split_buf}_  (Enter to open, Esc to cancel)"
+                bar1_color = curses.color_pair(3) | curses.A_BOLD
+            elif link_buf:
+                dest = "Other Split (T)" if link_open_split else "Current Pane (Enter)"
+                bar1 = f" 🔗 Follow Link #{link_buf}_ in {dest}  (Esc to cancel)"
+                bar1_color = curses.color_pair(3) | curses.A_BOLD
             elif status_note:
-                bar2 = f" {status_note}  |  j/k Scroll  d/u Half-Page  1-9 Link#  E GUI  b Bookmark  s Save  q Quit"
+                bar1 = f" {status_note}"
+                bar1_color = curses.color_pair(2) | curses.A_BOLD
+            elif len(buffers) >= 2:
+                bar1 = f" Pane [{active_pane + 1}/2] Active: {buffers[active_pane]['title'][:w - 35]}"
+                bar1_color = curses.color_pair(5) | curses.A_BOLD
             else:
-                bar2 = " j/k Scroll  |  d/u Page  |  g/G Top/Bot  |  0-9 Follow Link  |  E GUI  |  b Mark  |  s Save  |  q Quit"
+                bar1 = f" 📖 {buffers[0]['title'][:w - 25]}"
+                bar1_color = curses.color_pair(5) | curses.A_BOLD
+
+            if len(buffers) >= 2:
+                bar2 = " j/k: Scroll Pane | Tab: Switch Pane | t: New Split | x: Close Split | 1-9: Link | E: GUI | q: Close/Quit"
+            else:
+                bar2 = " j/k: Scroll | t: Split View | 0-9: Link | E: GUI | b: Bookmark | s: Save | q: Quit"
 
             try:
-                stdscr.addstr(h - 2, 0, bar1[:w - 1].ljust(w - 1), curses.color_pair(5) | curses.A_BOLD)
+                stdscr.addstr(h - 2, 0, bar1[:w - 1].ljust(w - 1), bar1_color)
                 stdscr.addstr(h - 1, 0, bar2[:w - 1].ljust(w - 1), curses.A_BOLD)
             except curses.error:
                 pass
@@ -458,49 +579,190 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
             stdscr.refresh()
             key = stdscr.getch()
 
+            # Handle Split input prompt
+            if split_prompt:
+                if key in (10, 13):  # Enter
+                    query = split_buf.strip()
+                    split_buf = ""
+                    split_prompt = False
+                    if query:
+                        status_note = f"[*] Resolving '{query}'..."
+                        stdscr.addstr(h - 2, 0, status_note.ljust(w - 1), curses.color_pair(3) | curses.A_BOLD)
+                        stdscr.refresh()
+                        target_url = resolve_url_or_search(query)
+                        if target_url:
+                            try:
+                                status_note = f"[*] Extracting {target_url}..."
+                                stdscr.addstr(h - 2, 0, status_note.ljust(w - 1), curses.color_pair(3) | curses.A_BOLD)
+                                stdscr.refresh()
+                                n_md, n_title, n_links, n_url = extract_content(target_url)
+                                new_buf = {
+                                    "url": n_url,
+                                    "title": n_title or n_url,
+                                    "md_text": n_md,
+                                    "links": n_links,
+                                    "scroll_y": 0,
+                                    "rendered_width": None,
+                                    "parsed_lines": []
+                                }
+                                if len(buffers) == 1:
+                                    buffers.append(new_buf)
+                                    active_pane = 1
+                                    status_note = "[+] Opened side-by-side split on right"
+                                else:
+                                    buffers[active_pane] = new_buf
+                                    status_note = f"[+] Loaded into pane [{active_pane + 1}]"
+                            except Exception as e:
+                                status_note = f"[!] Extraction error: {e}"
+                        else:
+                            status_note = "[-] Could not resolve URL or query."
+                elif key == 27:  # Esc
+                    split_buf = ""
+                    split_prompt = False
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    split_buf = split_buf[:-1]
+                elif 32 <= key <= 126:
+                    split_buf += chr(key)
+                continue
+
+            # Handle Link buffer prompt
             if link_buf:
                 if key in (10, 13):  # Enter
                     try:
                         num = int(link_buf)
                     except ValueError:
                         num = -1
+                    target_links = buffers[active_pane]["links"]
+                    match = [l for l in target_links if l[0] == num]
                     link_buf = ""
-                    match = [l for l in links if l[0] == num]
                     if match:
-                        action_After["type"] = "link"
-                        action_After["payload"] = match[0][2]
-                        break
+                        link_url = match[0][2]
+                        status_note = f"[*] Loading link: {link_url}..."
+                        stdscr.addstr(h - 2, 0, status_note.ljust(w - 1), curses.color_pair(3) | curses.A_BOLD)
+                        stdscr.refresh()
+                        try:
+                            n_md, n_title, n_links, n_url = extract_content(link_url)
+                            new_buf = {
+                                "url": n_url,
+                                "title": n_title or n_url,
+                                "md_text": n_md,
+                                "links": n_links,
+                                "scroll_y": 0,
+                                "rendered_width": None,
+                                "parsed_lines": []
+                            }
+                            if link_open_split:
+                                if len(buffers) == 1:
+                                    buffers.append(new_buf)
+                                    active_pane = 1
+                                else:
+                                    other = 1 - active_pane
+                                    buffers[other] = new_buf
+                                    active_pane = other
+                                status_note = f"[+] Followed link to split pane [{active_pane + 1}]"
+                            else:
+                                buffers[active_pane] = new_buf
+                                status_note = f"[+] Loaded link into pane [{active_pane + 1}]"
+                        except Exception as e:
+                            status_note = f"[!] Failed to load link: {e}"
                     else:
-                        status_note = f"[-] Link [{num}] not found (1..{len(links)})"
-                elif key == 27:  # Escape
+                        status_note = f"[-] Link [{num}] not found"
+                elif key == 27:  # Esc
                     link_buf = ""
+                elif key in (ord('T'), ord('t')):
+                    link_open_split = True
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
                     link_buf = link_buf[:-1]
                 elif ord('0') <= key <= ord('9'):
                     link_buf += chr(key)
                 continue
 
+            # Mouse handling
+            if key == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                    if len(buffers) >= 2:
+                        pane_w = (w - 1) // 2
+                        hover_idx = 0 if mx < pane_w else 1
+                        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                            active_pane = hover_idx
+                        elif bstate & (curses.BUTTON4_PRESSED | 0x10000):
+                            buffers[hover_idx]["scroll_y"] = max(0, buffers[hover_idx]["scroll_y"] - 3)
+                        elif bstate & (getattr(curses, 'BUTTON5_PRESSED', 0x80000) | 0x80000):
+                            ms = max(0, len(buffers[hover_idx]["parsed_lines"]) - view_h)
+                            buffers[hover_idx]["scroll_y"] = min(ms, buffers[hover_idx]["scroll_y"] + 3)
+                        else:
+                            active_pane = hover_idx
+                    else:
+                        if bstate & (curses.BUTTON4_PRESSED | 0x10000):
+                            buffers[0]["scroll_y"] = max(0, buffers[0]["scroll_y"] - 3)
+                        elif bstate & (getattr(curses, 'BUTTON5_PRESSED', 0x80000) | 0x80000):
+                            ms = max(0, len(buffers[0]["parsed_lines"]) - view_h)
+                            buffers[0]["scroll_y"] = min(ms, buffers[0]["scroll_y"] + 3)
+                except Exception:
+                    pass
+                continue
+
             status_note = ""
-            if key in (ord('q'), ord('Q'), 27):
+
+            # Keyboard scrolling strictly applies to active_pane
+            cur_buf = buffers[active_pane]
+            cur_max = max(0, len(cur_buf["parsed_lines"]) - view_h)
+
+            if key in (ord('q'), 27):
+                if len(buffers) >= 2:
+                    buffers.pop(active_pane)
+                    active_pane = 0
+                    status_note = "[-] Closed split pane"
+                else:
+                    break
+            elif key == ord('Q'):
                 break
-            elif key in (ord('j'), curses.KEY_DOWN, 10, 13):
-                scroll_y += 1
+            elif key in (ord('x'), ord('\x17')):  # x or Ctrl-w
+                if len(buffers) >= 2:
+                    buffers.pop(active_pane)
+                    active_pane = 0
+                    status_note = "[-] Closed split pane"
+                else:
+                    break
+            elif key in (ord('j'), curses.KEY_DOWN):
+                cur_buf["scroll_y"] = min(cur_max, cur_buf["scroll_y"] + 1)
             elif key in (ord('k'), curses.KEY_UP):
-                scroll_y -= 1
+                cur_buf["scroll_y"] = max(0, cur_buf["scroll_y"] - 1)
             elif key in (ord('d'), curses.KEY_NPAGE, ord(' ')):
-                scroll_y += view_h // 2
+                cur_buf["scroll_y"] = min(cur_max, cur_buf["scroll_y"] + view_h // 2)
             elif key in (ord('u'), curses.KEY_PPAGE):
-                scroll_y -= view_h // 2
-            elif key == ord('g') or key == curses.KEY_HOME:
-                scroll_y = 0
-            elif key == ord('G') or key == curses.KEY_END:
-                scroll_y = max_scroll
+                cur_buf["scroll_y"] = max(0, cur_buf["scroll_y"] - view_h // 2)
+            elif key in (ord('g'), curses.KEY_HOME):
+                cur_buf["scroll_y"] = 0
+            elif key in (ord('G'), curses.KEY_END):
+                cur_buf["scroll_y"] = cur_max
+            elif key in (ord('\t'), 9, curses.KEY_BTAB):  # Tab toggles active pane
+                if len(buffers) >= 2:
+                    active_pane = 1 - active_pane
+            elif key in (ord('h'), curses.KEY_LEFT):
+                if len(buffers) >= 2:
+                    active_pane = 0
+            elif key in (ord('l'), curses.KEY_RIGHT):
+                if len(buffers) >= 2:
+                    active_pane = 1
+            elif key in (ord('t'), ord('\x01'), ord('\x14')):  # t, Ctrl-a, or Ctrl-t -> open split
+                split_prompt = True
+                split_buf = ""
+            elif key == ord('T'):  # Follow link in new split
+                link_open_split = True
+                link_buf = ""
+            elif ord('1') <= key <= ord('9'):
+                link_open_split = False
+                link_buf = chr(key)
             elif key in (ord('e'), ord('E')):
+                # Escalate to wf-view with all currently open buffer URLs
+                all_urls = [b["url"] for b in buffers]
                 wf_view_bin = Path(__file__).resolve().parent / "wf-view"
                 curses.def_prog_mode()
                 curses.endwin()
                 try:
-                    subprocess.run([str(wf_view_bin), "--from-reader", url])
+                    subprocess.run([str(wf_view_bin), "--from-reader"] + all_urls)
                 except Exception:
                     pass
                 finally:
@@ -509,45 +771,52 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
                     stdscr.refresh()
                 status_note = "[*] Returned from GUI viewer (wf-view)"
             elif key in (ord('b'), ord('B')):
-                bookmark(url, title)
-                status_note = "[+] Bookmarked page!"
+                bookmark(cur_buf["url"], cur_buf["title"])
+                status_note = f"[+] Bookmarked pane [{active_pane + 1}]!"
             elif key in (ord('s'), ord('S')):
                 save_dir = Path.home() / "Documents" / "Webflow"
                 save_dir.mkdir(parents=True, exist_ok=True)
-                safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip() or "article"
+                safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in cur_buf["title"]).strip() or "article"
                 target_file = save_dir / f"{safe_title}.md"
-                target_file.write_text(f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n{md_text}", encoding="utf-8")
+                target_file.write_text(f"# {cur_buf['title']}\n\n**Source**: [{cur_buf['url']}]({cur_buf['url']})\n\n---\n\n{cur_buf['md_text']}", encoding="utf-8")
                 status_note = f"[+] Saved to ~/Documents/Webflow/{safe_title}.md"
-            elif ord('1') <= key <= ord('9'):
-                link_buf = chr(key)
 
     curses.wrapper(_curses_reader)
-
-    if action_After["type"] == "link" and action_After["payload"]:
-        wf_open_bin = Path(__file__).resolve().parent / "wf-open"
-        os.execv(str(wf_open_bin), [str(wf_open_bin), action_After["payload"]])
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.stderr.write("Usage: wf-reader <url>\n")
+        sys.stderr.write("Usage: wf-reader <url> [url2 ...]\n")
         sys.exit(1)
 
-    url = sys.argv[1].strip()
-    if not re.match(r"^https?://", url):
-        url = "https://" + url
+    urls = sys.argv[1:]
+    initial_buffers = []
 
-    print(f"[*] Extracting & typesetting: {url}...")
-    try:
-        md_text, title, links, url = extract_content(url)
-        if not title:
-            title = url
-        run_interactive_reader(url, title, md_text, links)
-    except Exception as e:
-        sys.stderr.write(f"[!] Reader extraction failed: {e}\n")
+    for u in urls[:2]:
+        u = u.strip()
+        if not re.match(r"^https?://", u):
+            u = "https://" + u
+        print(f"[*] Extracting & typesetting: {u}...")
+        try:
+            md_text, title, links, final_url = extract_content(u)
+            initial_buffers.append({
+                "url": final_url,
+                "title": title or final_url,
+                "md_text": md_text,
+                "links": links,
+                "scroll_y": 0,
+                "rendered_width": None,
+                "parsed_lines": []
+            })
+        except Exception as e:
+            sys.stderr.write(f"[!] Reader extraction failed for {u}: {e}\n")
+
+    if not initial_buffers:
         print("[*] Escalating to Tier 3 (wf-view)...")
         wf_view_bin = Path(__file__).resolve().parent / "wf-view"
-        os.execv(str(wf_view_bin), [str(wf_view_bin), url])
+        os.execv(str(wf_view_bin), [str(wf_view_bin)] + urls)
+
+    run_interactive_reader(initial_buffers)
 
 
 if __name__ == "__main__":

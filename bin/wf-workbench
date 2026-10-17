@@ -134,12 +134,14 @@ def open_workbench(name: str):
     bin_dir = Path(__file__).resolve().parent
     wf_view = bin_dir / "wf-view"
 
-    print(f"[*] Launching Workbench '{name}' ({len(tabs)} tabs)...")
-    for item in tabs:
-        url = item.get("url")
-        if url:
-            subprocess.Popen([str(wf_view), "--workbench", name, url])
-            time.sleep(0.25)
+    urls = [item.get("url") for item in tabs if item.get("url")]
+    if not urls:
+        print(f"Workbench '{name}' has no valid URLs.")
+        return False
+
+    print(f"[*] Launching Workbench '{name}' ({len(urls)} tabs in clustered window)...")
+    cmd = [str(wf_view), "--workbench", name] + urls
+    subprocess.Popen(cmd, start_new_session=True)
     return True
 
 
