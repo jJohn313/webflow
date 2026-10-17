@@ -496,8 +496,18 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
             elif key == ord('G') or key == curses.KEY_END:
                 scroll_y = max_scroll
             elif key in (ord('e'), ord('E')):
-                action_After["type"] = "escalate"
-                break
+                wf_view_bin = Path(__file__).resolve().parent / "wf-view"
+                curses.def_prog_mode()
+                curses.endwin()
+                try:
+                    subprocess.run([str(wf_view_bin), "--from-reader", url])
+                except Exception:
+                    pass
+                finally:
+                    curses.reset_prog_mode()
+                    stdscr.clear()
+                    stdscr.refresh()
+                status_note = "[*] Returned from GUI viewer (wf-view)"
             elif key in (ord('b'), ord('B')):
                 bookmark(url, title)
                 status_note = "[+] Bookmarked page!"
@@ -513,10 +523,7 @@ def run_interactive_reader(url: str, title: str, md_text: str, links: list):
 
     curses.wrapper(_curses_reader)
 
-    if action_After["type"] == "escalate":
-        wf_view_bin = Path(__file__).resolve().parent / "wf-view"
-        subprocess.Popen([str(wf_view_bin), url], start_new_session=True)
-    elif action_After["type"] == "link" and action_After["payload"]:
+    if action_After["type"] == "link" and action_After["payload"]:
         wf_open_bin = Path(__file__).resolve().parent / "wf-open"
         os.execv(str(wf_open_bin), [str(wf_open_bin), action_After["payload"]])
 

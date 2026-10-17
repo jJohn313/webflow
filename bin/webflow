@@ -11,6 +11,7 @@ import time
 import curses
 import urllib.parse
 import urllib.request
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,11 @@ BIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BIN_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 from lib.vault import WebflowVault, extract_domain_parts
+from lib.theme import (
+    PAIR_HEADER, PAIR_TIER1, PAIR_TIER2, PAIR_TIER3, PAIR_SELECTED,
+    PAIR_BORDER, PAIR_BORDER_ACTIVE, PAIR_TEXT, PAIR_DIM,
+    PAIR_PILL_NORMAL, PAIR_PILL_SEARCH, load_theme_config, init_curses_theme
+)
 
 
 def ensure_dirs():
@@ -296,20 +302,8 @@ class WebflowTUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.set_cursor(0)
-        self.has_colors = curses.has_colors()
-        if self.has_colors:
-            try:
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_CYAN, -1)     # Header/Focus
-                curses.init_pair(2, curses.COLOR_GREEN, -1)    # Tier 1 / URL
-                curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Tier 3 / Warnings
-                curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # Search input / Badges
-                curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)   # Selected Row
-                curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Top/Bottom Bars
-                curses.init_pair(7, curses.COLOR_WHITE, -1)    # Standard text
-            except Exception:
-                self.has_colors = False
+        self.theme = load_theme_config()
+        self.has_colors = init_curses_theme(self.theme)
 
         self.orig_color_pair = curses.color_pair
         curses.color_pair = lambda n: self.orig_color_pair(n) if self.has_colors else 0
@@ -337,7 +331,7 @@ class WebflowTUI:
         # Sovereign Credential Vault
         self.vault = WebflowVault()
 
-        self.status_msg = "NORMAL  |  / Search  |  Enter Open  |  v GUI  |  w Bench  |  P Vault  |  q Quit"
+        self.status_msg = "/ Search  |  Enter Open  |  v GUI  |  w Bench  |  y Yank  |  x Delete  |  q Quit"
 
         self.workbenches = load_workbenches()
         self.history = load_history()
@@ -374,61 +368,164 @@ class WebflowTUI:
     def draw(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        if h < 16 or w < 70:
+        if h < 14 or w < 65:
             self.safe_addstr(0, 0, "Terminal window too small for 3-pane layout.")
             self.stdscr.refresh()
             return
 
         # 1. Header Banner
-        title_bar = " 🌐 Webflow 0.3 — Terminal-First Sovereign Web Architecture "
-        self.safe_addstr(0, 0, title_bar[:w - 1].ljust(w - 1), curses.color_pair(6) | curses.A_BOLD)
+        title_bar = " 🌐 Webflow 0.3 — Sovereign Terminal-First Web Architecture "
+        self.safe_addstr(0, 0, title_bar[:w - 1].ljust(w - 1), curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
 
-        # 2. Dimensions: Nav (20%), Middle (50%), Preview (30%)
-        nav_w = max(24, int(w * 0.20))
-        mid_w = int(w * 0.50)
-        prev_w = w - nav_w - mid_w - 1
-        content_h = h - 3
+        # 2. Dimensions & Ratios
+        r_nav = self.theme["layout"].get("ratio_nav", 0.20)
+        r_mid = self.theme["layout"].get("ratio_mid", 0.48)
+        col1_w = max(22, int(w * r_nav))
+        col2_w = max(30, int(w * r_mid))
+        col3_w = (w - 1) - col1_w - col2_w
 
-        # Column 1: Navigation
-        self.draw_box(1, 0, content_h, nav_w, " 1. Sections ", self.active_pane == 0)
+        grid_y = 1
+        grid_h = h - 2
+        content_h = grid_h - 2
+
+        current_section = self.nav_items[self.nav_idx][1]
+        titles = [
+            "1. Sections",
+            f"2. {self.nav_items[self.nav_idx][0]}",
+            "3. Live Preview & Route"
+        ]
+
+        # 3. Draw Unified Outer Frame & Vertical Dividers
+        self.draw_unified_grid(grid_y, grid_h, w, col1_w, col2_w, col3_w, titles)
+
+        # 4. Column 1: Navigation
         for idx, (label, tag) in enumerate(self.nav_items):
-            y = 3 + idx * 2
-            if y < content_h:
+            y = grid_y + 2 + idx * 2
+            if y < grid_y + grid_h - 1:
                 prefix = " ❯ " if idx == self.nav_idx else "   "
+                text = f"{prefix}{label}"
+                inner_w = col1_w - 1
                 if idx == self.nav_idx:
-                    self.safe_addstr(y, 1, f"{prefix}{label}".ljust(nav_w - 2)[:nav_w - 2], curses.color_pair(5) | curses.A_BOLD)
+                    self.safe_addstr(y, 1, text.ljust(inner_w)[:inner_w], curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
                 else:
-                    self.safe_addstr(y, 1, f"{prefix}{label}".ljust(nav_w - 2)[:nav_w - 2], curses.color_pair(7))
+                    self.safe_addstr(y, 1, text.ljust(inner_w)[:inner_w], curses.color_pair(PAIR_TEXT))
 
         # Column 2: Active Middle Pane
-        current_section = self.nav_items[self.nav_idx][1]
-        mid_title = f" 2. {self.nav_items[self.nav_idx][0]} "
-        self.draw_box(1, nav_w, content_h, mid_w, mid_title, self.active_pane == 1)
-
+        c2_x = col1_w + 1
+        c2_w = col2_w - 1
         if current_section == "search":
-            self.draw_search_pane(1, nav_w, content_h, mid_w)
+            self.draw_search_pane(grid_y + 1, c2_x, content_h, c2_w)
         elif current_section == "workbenches":
-            self.draw_workbenches_pane(1, nav_w, content_h, mid_w)
+            self.draw_workbenches_pane(grid_y + 1, c2_x, content_h, c2_w)
         elif current_section == "new_bench":
-            self.draw_new_bench_pane(1, nav_w, content_h, mid_w)
+            self.draw_new_bench_pane(grid_y + 1, c2_x, content_h, c2_w)
         elif current_section == "history":
-            self.draw_history_pane(1, nav_w, content_h, mid_w)
+            self.draw_history_pane(grid_y + 1, c2_x, content_h, c2_w)
         elif current_section == "bookmarks":
-            self.draw_bookmarks_pane(1, nav_w, content_h, mid_w)
+            self.draw_bookmarks_pane(grid_y + 1, c2_x, content_h, c2_w)
 
         # Column 3: Live Preview Panel
-        self.draw_box(1, nav_w + mid_w, content_h, prev_w, " 3. Live Preview & Route ", self.active_pane == 2)
-        self.draw_preview_pane(1, nav_w + mid_w, content_h, prev_w, current_section)
+        c3_x = col1_w + col2_w + 1
+        c3_w = col3_w - 1
+        self.draw_preview_pane(grid_y + 1, c3_x, content_h, c3_w, current_section)
 
-        # 4. Modal Workbench Picker Overlay (if active)
+        # 5. Modal Workbench Picker Overlay (if active)
         if self.wb_picker_active:
             self.draw_workbench_picker_modal(h, w)
 
-        # 5. Status Bar
-        status_bar = f" {self.status_msg} "
-        self.safe_addstr(h - 1, 0, status_bar[:w - 1].ljust(w - 1), curses.color_pair(6))
+        # 6. Bottom Pill Status Line (Yazi Aesthetic)
+        self.draw_bottom_status_bar(h, w)
 
         self.stdscr.refresh()
+
+    def draw_unified_grid(self, y, h, w, col1_w, col2_w, col3_w, titles):
+        x0 = 0
+        x1 = col1_w
+        x2 = col1_w + col2_w
+        x3 = w - 1
+
+        b_color = curses.color_pair(PAIR_BORDER)
+
+        # Top border: ╭───┬───┬───╮
+        top_chars = ["─"] * w
+        top_chars[x0] = "╭"
+        if x1 < w:
+            top_chars[x1] = "┬"
+        if x2 < w:
+            top_chars[x2] = "┬"
+        if x3 < w:
+            top_chars[x3] = "╮"
+        self.safe_addstr(y, 0, "".join(top_chars[:w]), b_color)
+
+        # Column titles along the top border
+        col_xs = [x0 + 2, x1 + 2, x2 + 2]
+        col_max_ws = [col1_w - 4, col2_w - 4, col3_w - 4]
+        for c_idx in range(3):
+            if c_idx < len(titles):
+                title_str = f" {titles[c_idx].strip()} "
+                max_w = col_max_ws[c_idx]
+                if max_w > 4:
+                    truncated = title_str[:max_w]
+                    t_attr = (curses.color_pair(PAIR_BORDER_ACTIVE) | curses.A_BOLD) if c_idx == self.active_pane else b_color
+                    self.safe_addstr(y, col_xs[c_idx], truncated, t_attr)
+
+        # Interior vertical dividers: │   │   │   │
+        for row in range(y + 1, y + h - 1):
+            self.safe_addstr(row, x0, "│", b_color)
+            if x1 < w:
+                self.safe_addstr(row, x1, "│", b_color)
+            if x2 < w:
+                self.safe_addstr(row, x2, "│", b_color)
+            if x3 < w:
+                self.safe_addstr(row, x3, "│", b_color)
+
+        # Bottom border: ╰───┴───┴───╯
+        bot_chars = ["─"] * w
+        bot_chars[x0] = "╰"
+        if x1 < w:
+            bot_chars[x1] = "┴"
+        if x2 < w:
+            bot_chars[x2] = "┴"
+        if x3 < w:
+            bot_chars[x3] = "╯"
+        self.safe_addstr(y + h - 1, 0, "".join(bot_chars[:w]), b_color)
+
+    def draw_bottom_status_bar(self, h, w):
+        by = h - 1
+        # Clear bottom line
+        self.safe_addstr(by, 0, " " * (w - 1), curses.color_pair(PAIR_BORDER))
+
+        # 1. Left Pill: [ NORMAL ] or [ SEARCH ]
+        if self.is_searching:
+            pill = " SEARCH "
+            pill_attr = curses.color_pair(PAIR_PILL_SEARCH) | curses.A_BOLD
+        else:
+            pill = " NORMAL "
+            pill_attr = curses.color_pair(PAIR_PILL_NORMAL) | curses.A_BOLD
+
+        self.safe_addstr(by, 0, pill, pill_attr)
+        px = len(pill) + 1
+
+        # 2. Main Status or Search Buffer
+        if self.is_searching:
+            msg = f"/{self.search_query}"
+        else:
+            msg = self.status_msg
+
+        # Reserve space for right-side pills
+        cur_len = self.get_current_list_len()
+        pos_str = f"[{self.list_idx + 1}/{cur_len}]" if cur_len > 0 else "[--]"
+        pane_names = ["NAV", "LIST", "PREVIEW"]
+        active_pane_str = pane_names[self.active_pane]
+        sec_name = self.nav_items[self.nav_idx][1].upper()
+        right_pill = f" {pos_str}  [{active_pane_str}:{sec_name}] "
+
+        max_msg_w = max(0, w - px - len(right_pill) - 2)
+        self.safe_addstr(by, px, msg[:max_msg_w], curses.color_pair(PAIR_TEXT))
+
+        # 3. Right Pill
+        rx = max(px + len(msg[:max_msg_w]), w - len(right_pill) - 1)
+        self.safe_addstr(by, rx, right_pill, curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
 
     def get_visible_slice(self, items, selected_idx, max_rows):
         if not items or max_rows <= 0:
@@ -442,11 +539,11 @@ class WebflowTUI:
         return [(i, items[i]) for i in range(start, end)], start
 
     def draw_box(self, y, x, h, w, title="", is_active=False, fill=False):
-        color = (curses.color_pair(1) | curses.A_BOLD) if is_active else curses.color_pair(7)
+        color = (curses.color_pair(PAIR_BORDER_ACTIVE) | curses.A_BOLD) if is_active else curses.color_pair(PAIR_BORDER)
         self.safe_addstr(y, x, "╭" + "─" * (w - 2) + "╮", color)
         for i in range(1, h - 1):
             if fill:
-                self.safe_addstr(y + i, x, "│" + (" " * (w - 2)) + "│", color)
+                self.safe_addstr(y + i, x, "│" + (" " * (w - 2)) + "│", curses.color_pair(PAIR_HEADER))
             else:
                 self.safe_addstr(y + i, x, "│", color)
                 self.safe_addstr(y + i, x + w - 1, "│", color)
@@ -458,101 +555,137 @@ class WebflowTUI:
 
     def draw_search_pane(self, py, px, ph, pw):
         # Framed Search Input Box (3 rows tall)
-        s_color = (curses.color_pair(4) | curses.A_BOLD) if self.is_searching else curses.color_pair(1)
-        self.safe_addstr(py + 1, px + 2, "╭" + "─" * (pw - 6) + "╮", s_color)
+        s_color = (curses.color_pair(PAIR_BORDER_ACTIVE) | curses.A_BOLD) if self.is_searching else curses.color_pair(PAIR_BORDER)
+        box_w = max(10, pw - 4)
+        self.safe_addstr(py + 1, px + 2, "╭" + "─" * (box_w - 2) + "╮", s_color)
         cursor_char = "█" if self.is_searching else ""
         prompt_str = f" 🔍 {self.search_query}{cursor_char}" if (self.search_query or self.is_searching) else " 🔍 Press [/] to search DuckDuckGo / Wikipedia / Direct URL..."
-        self.safe_addstr(py + 2, px + 2, "│" + prompt_str[:pw - 6].ljust(pw - 6) + "│", s_color)
-        self.safe_addstr(py + 3, px + 2, "╰" + "─" * (pw - 6) + "╯", s_color)
+        self.safe_addstr(py + 2, px + 2, "│" + prompt_str[:box_w - 2].ljust(box_w - 2) + "│", s_color)
+        self.safe_addstr(py + 3, px + 2, "╰" + "─" * (box_w - 2) + "╯", s_color)
 
         if not self.search_results:
-            self.safe_addstr(py + 6, px + 4, "No active search results.", curses.color_pair(3))
-            self.safe_addstr(py + 8, px + 4, "Tips:", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 9, px + 4, "• Press [/] to type a search query or domain (e.g. archlinux.org)", curses.color_pair(7))
-            self.safe_addstr(py + 10, px + 4, "• Press [Enter] to auto-route, [v] for WebKit GUI, [r] for Reader", curses.color_pair(7))
-            self.safe_addstr(py + 11, px + 4, "• Press [w] on any result to pick a Workbench from the popup menu", curses.color_pair(7))
+            self.safe_addstr(py + 5, px + 3, "No active search results.", curses.color_pair(PAIR_TIER2))
+            self.safe_addstr(py + 7, px + 3, "Tips:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 8, px + 3, "• Press [/] to type query or domain (e.g. archlinux.org)", curses.color_pair(PAIR_TEXT))
+            self.safe_addstr(py + 9, px + 3, "• Press [Enter] to open, [v] WebKit GUI, [r] Reader, [m] Media", curses.color_pair(PAIR_TEXT))
+            self.safe_addstr(py + 10, px + 3, "• Press [w] to assign to Workbench, [y] to yank URL", curses.color_pair(PAIR_TEXT))
             return
 
-        # Render Rich 2-Line Search Result Cards
-        avail_h = ph - 6
+        avail_h = ph - 5
         cards_per_page = max(1, avail_h // 2)
         visible_items, _ = self.get_visible_slice(self.search_results, self.list_idx, cards_per_page)
+        show_rel = self.theme["layout"].get("show_relative_numbers", True)
 
         for card_offset, (real_idx, item) in enumerate(visible_items):
             y1 = py + 4 + (card_offset * 2)
             y2 = y1 + 1
-            if y2 >= py + ph - 1:
+            if y2 >= py + ph:
                 break
 
-            is_sel = (real_idx == self.list_idx) and self.active_pane == 1
+            is_sel = (real_idx == self.list_idx) and (self.active_pane == 1)
             url = item.get("url", "")
             domain = item.get("domain", "")
             snippet = item.get("snippet", "")
             pred = predict_tier(url)
             if "TIER2" in pred:
                 tier_badge = "[T2]"
-                t_color = curses.color_pair(6) | curses.A_BOLD
+                t_color = curses.color_pair(PAIR_TIER2) | curses.A_BOLD
             elif "TIER1" in pred:
                 tier_badge = "[T1]"
-                t_color = curses.color_pair(2) | curses.A_BOLD
+                t_color = curses.color_pair(PAIR_TIER1) | curses.A_BOLD
             else:
                 tier_badge = "[T3]"
-                t_color = curses.color_pair(3) | curses.A_BOLD
+                t_color = curses.color_pair(PAIR_TIER3) | curses.A_BOLD
 
-            line1 = f" {real_idx + 1:2d}. {item.get('title', '')}"
+            if show_rel and self.active_pane == 1:
+                if real_idx == self.list_idx:
+                    num_prefix = f" > {real_idx + 1:2d} "
+                else:
+                    dist = abs(real_idx - self.list_idx)
+                    num_prefix = f"   {dist:2d} "
+            else:
+                num_prefix = f" {real_idx + 1:2d}. "
+
+            title_part = f"{item.get('title', '')}"
             badge_str = f" {tier_badge} "
-            max_t = pw - 4 - len(badge_str)
-            line1_fmt = line1[:max_t].ljust(max_t) + badge_str
-
-            sub_text = f"     🌐 {domain} — {snippet}" if snippet else f"     🌐 {url}"
+            card_w = pw - 2
+            max_title_w = max(10, card_w - len(num_prefix) - len(badge_str))
+            line1_raw = f"{num_prefix}{title_part[:max_title_w].ljust(max_title_w)}{badge_str}"
+            sub_text = f"       🌐 {domain} — {snippet}" if snippet else f"       🌐 {url}"
 
             if is_sel:
-                self.safe_addstr(y1, px + 1, line1_fmt[:pw - 2].ljust(pw - 2), curses.color_pair(5) | curses.A_BOLD)
-                self.safe_addstr(y2, px + 1, sub_text[:pw - 2].ljust(pw - 2), curses.color_pair(5))
+                self.safe_addstr(y1, px + 1, line1_raw[:card_w].ljust(card_w), curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
+                self.safe_addstr(y2, px + 1, sub_text[:card_w].ljust(card_w), curses.color_pair(PAIR_SELECTED))
             else:
-                self.safe_addstr(y1, px + 1, line1[:max_t], curses.color_pair(7) | curses.A_BOLD)
-                self.safe_addstr(y1, px + 1 + max_t, badge_str, t_color)
-                self.safe_addstr(y2, px + 1, sub_text[:pw - 3], curses.color_pair(1) | curses.A_DIM)
+                self.safe_addstr(y1, px + 1, num_prefix, curses.color_pair(PAIR_DIM))
+                self.safe_addstr(y1, px + 1 + len(num_prefix), title_part[:max_title_w], curses.color_pair(PAIR_TEXT) | curses.A_BOLD)
+                self.safe_addstr(y1, px + 1 + len(num_prefix) + max_title_w, badge_str, t_color)
+                self.safe_addstr(y2, px + 1, sub_text[:card_w], curses.color_pair(PAIR_DIM))
 
     def draw_workbenches_pane(self, py, px, ph, pw):
         if not self.workbenches:
-            self.safe_addstr(py + 3, px + 3, "No workbenches saved yet.", curses.color_pair(3))
-            self.safe_addstr(py + 5, px + 3, "Press [w] on any search/history item or select ➕ New Workbench.", curses.color_pair(7))
+            self.safe_addstr(py + 3, px + 3, "No workbenches saved yet.", curses.color_pair(PAIR_TIER2))
+            self.safe_addstr(py + 5, px + 3, "Press [w] on any search/history item or select ➕ New Workbench.", curses.color_pair(PAIR_TEXT))
             return
+
+        self.safe_addstr(py + 1, px + 2, "Saved Workbenches  ([Enter] Open  [x] Delete)", curses.color_pair(PAIR_DIM))
 
         max_rows = ph - 3
         visible_items, _ = self.get_visible_slice(self.workbenches, self.list_idx, max_rows)
+        show_rel = self.theme["layout"].get("show_relative_numbers", True)
+
         for row_offset, (real_idx, b) in enumerate(visible_items):
             y = py + 2 + row_offset
-            is_sel = (real_idx == self.list_idx) and self.active_pane == 1
+            if y >= py + ph:
+                break
+            is_sel = (real_idx == self.list_idx) and (self.active_pane == 1)
             tab_count = len(b.get("tabs", []))
             updated = b.get("updated_at", "")[:16]
-            line = f" 🗂  {b.get('name'):<22} [{tab_count:2d} tabs]   {updated}"
-            if is_sel:
-                self.safe_addstr(y, px + 1, line[:pw - 2].ljust(pw - 2), curses.color_pair(5) | curses.A_BOLD)
+
+            if show_rel and self.active_pane == 1:
+                if real_idx == self.list_idx:
+                    num_prefix = f" > {real_idx + 1:2d} "
+                else:
+                    dist = abs(real_idx - self.list_idx)
+                    num_prefix = f"   {dist:2d} "
             else:
-                self.safe_addstr(y, px + 2, line[:pw - 4], curses.color_pair(7))
+                num_prefix = f" {real_idx + 1:2d}. "
+
+            row_w = pw - 2
+            line_full = f"{num_prefix}🗂  {b.get('name'):<20} [{tab_count:2d} tabs]   {updated}"
+
+            if is_sel:
+                self.safe_addstr(y, px + 1, line_full[:row_w].ljust(row_w), curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
+            else:
+                self.safe_addstr(y, px + 1, num_prefix, curses.color_pair(PAIR_DIM))
+                cur_x = px + 1 + len(num_prefix)
+                self.safe_addstr(y, cur_x, f"🗂  {b.get('name'):<20} ", curses.color_pair(PAIR_TEXT) | curses.A_BOLD)
+                cur_x += 24
+                self.safe_addstr(y, cur_x, f"[{tab_count:2d} tabs]   {updated}", curses.color_pair(PAIR_DIM))
 
     def draw_new_bench_pane(self, py, px, ph, pw):
-        self.safe_addstr(py + 3, px + 3, "Create Named Persistent Workbench:", curses.color_pair(1) | curses.A_BOLD)
-        self.safe_addstr(py + 5, px + 3, "Press [Enter] to name and initialize a new project workbench.", curses.color_pair(7))
-        self.safe_addstr(py + 7, px + 3, "• Logins & cookies are shared seamlessly per-domain.", curses.color_pair(2))
-        self.safe_addstr(py + 8, px + 3, "• Tabs automatically update their URLs when you close wf-view.", curses.color_pair(2))
+        self.safe_addstr(py + 3, px + 3, "Create Named Persistent Workbench:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+        self.safe_addstr(py + 5, px + 3, "Press [Enter] to name and initialize a new project workbench.", curses.color_pair(PAIR_TEXT))
+        self.safe_addstr(py + 7, px + 3, "• Logins & cookies are shared seamlessly per-domain.", curses.color_pair(PAIR_TIER1))
+        self.safe_addstr(py + 8, px + 3, "• Tabs automatically update their URLs when you close wf-view.", curses.color_pair(PAIR_TIER1))
 
     def draw_history_pane(self, py, px, ph, pw):
         if not self.history:
-            self.safe_addstr(py + 3, px + 3, "History is currently empty.", curses.color_pair(3))
+            self.safe_addstr(py + 3, px + 3, "History is currently empty.", curses.color_pair(PAIR_TIER2))
             return
 
-        self.safe_addstr(py + 1, px + 2, " Deduplicated Chronological Stream  (Press [x] Delete Item, [C] Clear All) ", curses.color_pair(1) | curses.A_DIM)
+        self.safe_addstr(py + 1, px + 2, "Deduplicated Stream  ([x] Delete  [C] Clear  [y] Yank)", curses.color_pair(PAIR_DIM))
 
-        max_rows = ph - 4
+        max_rows = ph - 3
         visible_items, _ = self.get_visible_slice(self.history, self.list_idx, max_rows)
         today_str = time.strftime("%Y-%m-%d")
+        show_rel = self.theme["layout"].get("show_relative_numbers", True)
 
         for row_offset, (real_idx, entry) in enumerate(visible_items):
             y = py + 2 + row_offset
-            is_sel = (real_idx == self.list_idx) and self.active_pane == 1
+            if y >= py + ph:
+                break
+            is_sel = (real_idx == self.list_idx) and (self.active_pane == 1)
             date_str = entry.get("date", "")
             date_tag = "Today" if date_str == today_str else date_str[5:]
             t_str = entry.get("time", entry.get("timestamp", ""))[:5]
@@ -561,39 +694,76 @@ class WebflowTUI:
             count_badge = f"×{count} " if count > 1 else "   "
             title = entry.get("title") or entry.get("domain") or entry.get("url", "")
             domain = entry.get("domain", "")
-            if title != domain and domain:
-                display_title = f"{title} ({domain})"
-            else:
-                display_title = title
+            display_title = f"{title} ({domain})" if (title != domain and domain) else title
 
-            line = f" {date_tag:<5} {t_str} [{tier}] {count_badge}{display_title}"
-            if is_sel:
-                self.safe_addstr(y, px + 1, line[:pw - 2].ljust(pw - 2), curses.color_pair(5) | curses.A_BOLD)
+            if show_rel and self.active_pane == 1:
+                if real_idx == self.list_idx:
+                    num_prefix = f" > {real_idx + 1:2d} "
+                else:
+                    dist = abs(real_idx - self.list_idx)
+                    num_prefix = f"   {dist:2d} "
             else:
-                self.safe_addstr(y, px + 1, f" {date_tag:<5} {t_str} ", curses.color_pair(7) | curses.A_DIM)
-                t_col = curses.color_pair(2) if tier == "T1" else curses.color_pair(3)
-                self.safe_addstr(y, px + 14, f"[{tier}] ", t_col)
+                num_prefix = f" {real_idx + 1:2d}. "
+
+            row_w = pw - 2
+            line_full = f"{num_prefix}{date_tag:<5} {t_str} [{tier}] {count_badge}{display_title}"
+
+            if is_sel:
+                self.safe_addstr(y, px + 1, line_full[:row_w].ljust(row_w), curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
+            else:
+                self.safe_addstr(y, px + 1, num_prefix, curses.color_pair(PAIR_DIM))
+                cur_x = px + 1 + len(num_prefix)
+                self.safe_addstr(y, cur_x, f"{date_tag:<5} {t_str} ", curses.color_pair(PAIR_DIM))
+                cur_x += 12
+                t_col = curses.color_pair(PAIR_TIER1) if tier == "T1" else curses.color_pair(PAIR_TIER3)
+                self.safe_addstr(y, cur_x, f"[{tier}] ", t_col)
+                cur_x += 5
                 if count > 1:
-                    self.safe_addstr(y, px + 19, f"{count_badge}", curses.color_pair(4) | curses.A_BOLD)
-                self.safe_addstr(y, px + 23, display_title[:max(0, pw - 25)], curses.color_pair(7))
+                    self.safe_addstr(y, cur_x, f"{count_badge}", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+                cur_x += len(count_badge)
+                avail_t = max(0, px + row_w - cur_x)
+                self.safe_addstr(y, cur_x, display_title[:avail_t], curses.color_pair(PAIR_TEXT))
 
     def draw_bookmarks_pane(self, py, px, ph, pw):
         if not self.bookmarks:
-            self.safe_addstr(py + 3, px + 3, "No deliberate bookmarks found.", curses.color_pair(3))
+            self.safe_addstr(py + 3, px + 3, "No deliberate bookmarks found.", curses.color_pair(PAIR_TIER2))
             return
+
+        self.safe_addstr(py + 1, px + 2, "Deliberate Bookmarks  ([x] Delete  [b] Add  [y] Yank)", curses.color_pair(PAIR_DIM))
 
         max_rows = ph - 3
         visible_items, _ = self.get_visible_slice(self.bookmarks, self.list_idx, max_rows)
+        show_rel = self.theme["layout"].get("show_relative_numbers", True)
+
         for row_offset, (real_idx, bm) in enumerate(visible_items):
             y = py + 2 + row_offset
-            is_sel = (real_idx == self.list_idx) and self.active_pane == 1
+            if y >= py + ph:
+                break
+            is_sel = (real_idx == self.list_idx) and (self.active_pane == 1)
             tag = bm.get("tag", "general")
             title = bm.get("title", bm.get("url", ""))
-            line = f" [{tag}] {title}"
-            if is_sel:
-                self.safe_addstr(y, px + 1, line[:pw - 2].ljust(pw - 2), curses.color_pair(5) | curses.A_BOLD)
+
+            if show_rel and self.active_pane == 1:
+                if real_idx == self.list_idx:
+                    num_prefix = f" > {real_idx + 1:2d} "
+                else:
+                    dist = abs(real_idx - self.list_idx)
+                    num_prefix = f"   {dist:2d} "
             else:
-                self.safe_addstr(y, px + 2, line[:pw - 4], curses.color_pair(7))
+                num_prefix = f" {real_idx + 1:2d}. "
+
+            row_w = pw - 2
+            line_full = f"{num_prefix}[{tag}] {title}"
+
+            if is_sel:
+                self.safe_addstr(y, px + 1, line_full[:row_w].ljust(row_w), curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
+            else:
+                self.safe_addstr(y, px + 1, num_prefix, curses.color_pair(PAIR_DIM))
+                cur_x = px + 1 + len(num_prefix)
+                self.safe_addstr(y, cur_x, f"[{tag}] ", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+                cur_x += len(tag) + 3
+                avail_t = max(0, px + row_w - cur_x)
+                self.safe_addstr(y, cur_x, title[:avail_t], curses.color_pair(PAIR_TEXT))
 
     def draw_preview_pane(self, py, px, ph, pw, section):
         if section == "search" and self.search_results and self.list_idx < len(self.search_results):
@@ -603,13 +773,13 @@ class WebflowTUI:
             snippet = sel_item.get("snippet", "")
             tier = predict_tier(url)
 
-            self.safe_addstr(py + 2, px + 2, "Title:", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 3, px + 2, title[:pw - 4], curses.color_pair(7) | curses.A_BOLD)
-            self.safe_addstr(py + 5, px + 2, "URL:", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 6, px + 2, url[:pw - 4], curses.color_pair(2))
-            self.safe_addstr(py + 8, px + 2, "Target Route:", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 9, px + 2, tier[:pw - 4], curses.color_pair(3))
-            self.safe_addstr(py + 11, px + 2, "Snippet:", curses.color_pair(1) | curses.A_BOLD)
+            self.safe_addstr(py + 2, px + 2, "Title:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 3, px + 2, title[:pw - 4], curses.color_pair(PAIR_TEXT) | curses.A_BOLD)
+            self.safe_addstr(py + 5, px + 2, "URL:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 6, px + 2, url[:pw - 4], curses.color_pair(PAIR_TIER1))
+            self.safe_addstr(py + 8, px + 2, "Target Route:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 9, px + 2, tier[:pw - 4], curses.color_pair(PAIR_TIER2))
+            self.safe_addstr(py + 11, px + 2, "Snippet:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
 
             words = snippet.split()
             line_y = py + 12
@@ -619,54 +789,54 @@ class WebflowTUI:
                     cur_line.append(word)
                 else:
                     if line_y < py + ph - 4:
-                        self.safe_addstr(line_y, px + 2, " ".join(cur_line), curses.color_pair(7))
+                        self.safe_addstr(line_y, px + 2, " ".join(cur_line), curses.color_pair(PAIR_TEXT))
                         line_y += 1
                     cur_line = [word]
             if cur_line and line_y < py + ph - 4:
-                self.safe_addstr(line_y, px + 2, " ".join(cur_line), curses.color_pair(7))
+                self.safe_addstr(line_y, px + 2, " ".join(cur_line), curses.color_pair(PAIR_TEXT))
 
         elif section == "workbenches" and self.workbenches and self.list_idx < len(self.workbenches):
             bench = self.workbenches[self.list_idx]
-            self.safe_addstr(py + 2, px + 2, f"Workbench: {bench.get('name')}", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 4, px + 2, f"Updated:   {bench.get('updated_at')}", curses.color_pair(7))
-            self.safe_addstr(py + 6, px + 2, "Persisted Tabs:", curses.color_pair(2) | curses.A_BOLD)
+            self.safe_addstr(py + 2, px + 2, f"Workbench: {bench.get('name')}", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 4, px + 2, f"Updated:   {bench.get('updated_at')}", curses.color_pair(PAIR_TEXT))
+            self.safe_addstr(py + 6, px + 2, "Persisted Tabs:", curses.color_pair(PAIR_TIER1) | curses.A_BOLD)
             tabs = bench.get("tabs", [])
             for ti, tab in enumerate(tabs[:ph - 10]):
                 u = tab.get("url", "")
                 t = tab.get("title", u)
-                self.safe_addstr(py + 8 + ti, px + 2, f"[{ti+1}] {t[:pw-8]}", curses.color_pair(7))
+                self.safe_addstr(py + 8 + ti, px + 2, f"[{ti+1}] {t[:pw-8]}", curses.color_pair(PAIR_TEXT))
 
         elif section == "history" and self.history and self.list_idx < len(self.history):
             h_entry = self.history[self.list_idx]
-            self.safe_addstr(py + 2, px + 2, "History Entry:", curses.color_pair(1) | curses.A_BOLD)
-            self.safe_addstr(py + 4, px + 2, f"Title:  {h_entry.get('title', '')[:pw-10]}", curses.color_pair(7) | curses.A_BOLD)
-            self.safe_addstr(py + 6, px + 2, f"Domain: {h_entry.get('domain', '')[:pw-10]}", curses.color_pair(1))
-            self.safe_addstr(py + 8, px + 2, f"URL:    {h_entry.get('url', '')[:pw-10]}", curses.color_pair(2))
-            self.safe_addstr(py + 10, px + 2, f"Last:   {h_entry.get('timestamp', '')}", curses.color_pair(7))
-            self.safe_addstr(py + 12, px + 2, f"Visits: {h_entry.get('count', 1)} time(s) on this date", curses.color_pair(4) | curses.A_BOLD)
-            self.safe_addstr(py + 14, px + 2, f"Route:  {h_entry.get('tier', '')}", curses.color_pair(3))
+            self.safe_addstr(py + 2, px + 2, "History Entry:", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 4, px + 2, f"Title:  {h_entry.get('title', '')[:pw-10]}", curses.color_pair(PAIR_TEXT) | curses.A_BOLD)
+            self.safe_addstr(py + 6, px + 2, f"Domain: {h_entry.get('domain', '')[:pw-10]}", curses.color_pair(PAIR_HEADER))
+            self.safe_addstr(py + 8, px + 2, f"URL:    {h_entry.get('url', '')[:pw-10]}", curses.color_pair(PAIR_TIER1))
+            self.safe_addstr(py + 10, px + 2, f"Last:   {h_entry.get('timestamp', '')}", curses.color_pair(PAIR_TEXT))
+            self.safe_addstr(py + 12, px + 2, f"Visits: {h_entry.get('count', 1)} time(s) on this date", curses.color_pair(PAIR_TIER3) | curses.A_BOLD)
+            self.safe_addstr(py + 14, px + 2, f"Route:  {h_entry.get('tier', '')}", curses.color_pair(PAIR_TIER2))
 
             dom = h_entry.get('domain', '')
             creds = self.vault.get_all_for_domain(dom)
             if creds:
                 users = ", ".join(c["username"] for c in creds)
-                self.safe_addstr(py + 16, px + 2, f"Vault:  🔐 Saved login ({users})"[:pw-4], curses.color_pair(2) | curses.A_BOLD)
+                self.safe_addstr(py + 16, px + 2, f"Vault:  🔐 Saved login ({users})"[:pw-4], curses.color_pair(PAIR_TIER1) | curses.A_BOLD)
 
         elif section == "bookmarks" and self.bookmarks and self.list_idx < len(self.bookmarks):
             bm = self.bookmarks[self.list_idx]
-            self.safe_addstr(py + 2, px + 2, f"Tag:   [{bm.get('tag', 'general')}]", curses.color_pair(4) | curses.A_BOLD)
-            self.safe_addstr(py + 4, px + 2, f"Note:  {bm.get('title', '')[:pw-9]}", curses.color_pair(7) | curses.A_BOLD)
-            self.safe_addstr(py + 6, px + 2, f"URL:   {bm.get('url', '')[:pw-9]}", curses.color_pair(2))
+            self.safe_addstr(py + 2, px + 2, f"Tag:   [{bm.get('tag', 'general')}]", curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
+            self.safe_addstr(py + 4, px + 2, f"Note:  {bm.get('title', '')[:pw-9]}", curses.color_pair(PAIR_TEXT) | curses.A_BOLD)
+            self.safe_addstr(py + 6, px + 2, f"URL:   {bm.get('url', '')[:pw-9]}", curses.color_pair(PAIR_TIER1))
 
             creds = self.vault.get_all_for_domain(bm.get('url', ''))
             if creds:
                 users = ", ".join(c["username"] for c in creds)
-                self.safe_addstr(py + 8, px + 2, f"Vault: 🔐 Saved login ({users})"[:pw-4], curses.color_pair(2) | curses.A_BOLD)
+                self.safe_addstr(py + 8, px + 2, f"Vault: 🔐 Saved login ({users})"[:pw-4], curses.color_pair(PAIR_TIER1) | curses.A_BOLD)
         else:
-            self.safe_addstr(py + 3, px + 3, "Select an item to preview details.", curses.color_pair(7))
+            self.safe_addstr(py + 3, px + 3, "Select an item to preview details.", curses.color_pair(PAIR_TEXT))
 
-        self.safe_addstr(py + ph - 3, px + 2, "─" * (pw - 4), curses.color_pair(7))
-        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [m] Media | [w] Bench | [P] Vault", curses.color_pair(1))
+        self.safe_addstr(py + ph - 3, px + 2, "─" * (pw - 4), curses.color_pair(PAIR_BORDER))
+        self.safe_addstr(py + ph - 2, px + 2, "[Enter] Open | [v] GUI | [m] Media | [w] Bench | [y] Yank | [x] Del", curses.color_pair(PAIR_HEADER))
 
     def draw_workbench_picker_modal(self, h, w):
         options = [b.get("name") for b in self.workbenches] + ["➕ Create New Workbench..."]
@@ -677,8 +847,8 @@ class WebflowTUI:
 
         self.draw_box(my, mx, mh, mw, " 🗂 Save URL to Workbench ", is_active=True, fill=True)
         short_u = (self.wb_picker_url or "")[:mw - 6]
-        self.safe_addstr(my + 1, mx + 3, f"Target: {short_u}", curses.color_pair(2))
-        self.safe_addstr(my + 2, mx + 2, "─" * (mw - 4), curses.color_pair(1))
+        self.safe_addstr(my + 1, mx + 3, f"Target: {short_u}", curses.color_pair(PAIR_TIER1))
+        self.safe_addstr(my + 2, mx + 2, "─" * (mw - 4), curses.color_pair(PAIR_BORDER))
 
         max_opts = mh - 5
         vis_opts, _ = self.get_visible_slice(options, self.wb_picker_idx, max_opts)
@@ -688,12 +858,12 @@ class WebflowTUI:
             prefix = " ❯ " if is_sel else "   "
             label = f"{prefix}{opt_name}"
             if is_sel:
-                self.safe_addstr(oy, mx + 2, label[:mw - 4].ljust(mw - 4), curses.color_pair(5) | curses.A_BOLD)
+                self.safe_addstr(oy, mx + 2, label[:mw - 4].ljust(mw - 4), curses.color_pair(PAIR_SELECTED) | curses.A_BOLD)
             else:
-                col = curses.color_pair(3) | curses.A_BOLD if real_i == len(options) - 1 else curses.color_pair(7)
+                col = (curses.color_pair(PAIR_TIER2) | curses.A_BOLD) if real_i == len(options) - 1 else curses.color_pair(PAIR_TEXT)
                 self.safe_addstr(oy, mx + 2, label[:mw - 4], col)
 
-        self.safe_addstr(my + mh - 2, mx + 3, "[j/k] Select  |  [Enter] Confirm  |  [Esc] Cancel", curses.color_pair(1))
+        self.safe_addstr(my + mh - 2, mx + 3, "[j/k] Select  |  [Enter] Confirm  |  [Esc] Cancel", curses.color_pair(PAIR_HEADER))
 
     def handle_input(self, key):
         # 1. Modal Workbench Picker Input
@@ -791,6 +961,8 @@ class WebflowTUI:
             self.open_workbench_picker()
         elif key in [ord('b'), ord('B')]:
             self.prompt_add_bookmark()
+        elif key in [ord('y'), ord('Y')]:
+            self.yank_selected_url()
         elif key == ord('x'):
             self.delete_selected_item()
         elif key == ord('C'):
@@ -816,7 +988,7 @@ class WebflowTUI:
         self.set_cursor(1)
         h, w = self.stdscr.getmaxyx()
         self.safe_addstr(h - 2, 2, " " * (w - 4))
-        self.safe_addstr(h - 2, 2, prompt_label, curses.color_pair(1) | curses.A_BOLD)
+        self.safe_addstr(h - 2, 2, prompt_label, curses.color_pair(PAIR_HEADER) | curses.A_BOLD)
         raw_bytes = self.stdscr.getstr(h - 2, 2 + len(prompt_label), max_chars)
         curses.noecho()
         self.set_cursor(0)
@@ -833,6 +1005,29 @@ class WebflowTUI:
         self.wb_picker_idx = 0
         self.wb_picker_active = True
 
+    def yank_selected_url(self):
+        url, _ = self.get_selected_url_and_title()
+        if not url:
+            self.status_msg = "[-] No URL selected to yank."
+            return
+        copied = False
+        if shutil.which("wl-copy"):
+            try:
+                subprocess.run(["wl-copy"], input=url.encode("utf-8"), check=True)
+                copied = True
+            except Exception:
+                pass
+        if not copied and shutil.which("xclip"):
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=url.encode("utf-8"), check=True)
+                copied = True
+            except Exception:
+                pass
+        if copied:
+            self.status_msg = f"📋 Yanked: {url}"
+        else:
+            self.status_msg = f"[-] Clipboard tool (wl-copy/xclip) not available."
+
     def delete_selected_item(self):
         sec = self.nav_items[self.nav_idx][1]
         if sec == "history" and self.history and self.list_idx < len(self.history):
@@ -845,6 +1040,30 @@ class WebflowTUI:
             self.history = load_history()
             self.list_idx = max(0, min(self.list_idx, len(self.history) - 1))
             self.status_msg = f"[+] Removed '{target_url}' from history."
+        elif sec == "bookmarks" and self.bookmarks and self.list_idx < len(self.bookmarks):
+            target = self.bookmarks[self.list_idx]
+            target_url = target.get("url")
+            if BOOKMARKS_FILE.exists():
+                lines = BOOKMARKS_FILE.read_text(encoding="utf-8").splitlines()
+                kept = []
+                for line in lines:
+                    parts = [p.strip() for p in line.split("|")]
+                    if parts and parts[0] == target_url:
+                        continue
+                    kept.append(line)
+                BOOKMARKS_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            self.bookmarks = load_bookmarks()
+            self.list_idx = max(0, min(self.list_idx, len(self.bookmarks) - 1))
+            self.status_msg = f"[+] Removed bookmark: {target.get('title')}"
+        elif sec == "workbenches" and self.workbenches and self.list_idx < len(self.workbenches):
+            bench_name = self.workbenches[self.list_idx].get("name")
+            safe_wb = "".join(c if c.isalnum() or c in "-_" else "_" for c in bench_name.strip())
+            manifest = WORKBENCHES_DIR / f"{safe_wb}.json"
+            if manifest.exists():
+                manifest.unlink(missing_ok=True)
+            self.workbenches = load_workbenches()
+            self.list_idx = max(0, min(self.list_idx, len(self.workbenches) - 1))
+            self.status_msg = f"[+] Deleted workbench: '{bench_name}'"
 
     def clear_history(self):
         if self.nav_items[self.nav_idx][1] == "history":

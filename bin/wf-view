@@ -63,11 +63,12 @@ def extract_root_domain(url: str) -> str:
 
 
 class WebflowViewer(Gtk.Window):
-    def __init__(self, initial_url: str, workbench: str = None):
+    def __init__(self, initial_url: str, workbench: str = None, from_reader: bool = False):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.initial_url = initial_url if "://" in initial_url else f"https://{initial_url}"
         self.root_domain = extract_root_domain(self.initial_url)
         self.workbench = workbench
+        self.from_reader = from_reader
         self.mode = "NORMAL"  # NORMAL | INSERT | HINTS | SEARCH
         self.pending_g = False
         self.search_text = ""
@@ -309,9 +310,10 @@ class WebflowViewer(Gtk.Window):
     def update_title(self):
         page_title = self.web_view.get_title() or self.root_domain
         wb_tag = f" [WB:{self.workbench}]" if self.workbench else ""
+        reader_tag = " [READER-SYNC]" if self.from_reader else ""
         search_tag = f" [/{self.search_text}]" if self.mode == "SEARCH" else ""
         notif_tag = f" [{self.status_notification}]" if self.status_notification else ""
-        self.set_title(f"wf-view [{self.mode}]{wb_tag}{search_tag}{notif_tag} (@{self.root_domain}) - {page_title}")
+        self.set_title(f"wf-view [{self.mode}]{wb_tag}{reader_tag}{search_tag}{notif_tag} (@{self.root_domain}) - {page_title}")
 
     def on_title_changed(self, view, param):
         self.update_title()
@@ -484,7 +486,10 @@ class WebflowViewer(Gtk.Window):
         elif keyname == "0":
             self.web_view.set_zoom_level(1.0)
             return True
-        elif keyname == "E":
+        elif keyname in ("E", "e"):
+            if self.from_reader:
+                self.on_quit()
+                return True
             uri = self.web_view.get_uri() or self.initial_url
             wf_reader = Path(__file__).resolve().parent / "wf-reader"
             subprocess.Popen(["kitty", "-e", str(wf_reader), uri])
@@ -613,10 +618,11 @@ def main():
     parser = argparse.ArgumentParser(description="Webflow Tier 3 WebKitGTK Viewer")
     parser.add_argument("url", help="Target URL")
     parser.add_argument("--workbench", "-w", default=None, help="Bind to named workbench session")
+    parser.add_argument("--from-reader", action="store_true", help="Escalated from interactive terminal reader")
     args = parser.parse_args()
 
     try:
-        app = WebflowViewer(args.url.strip(), workbench=args.workbench)
+        app = WebflowViewer(args.url.strip(), workbench=args.workbench, from_reader=args.from_reader)
         Gtk.main()
     except Exception:
         log_error(traceback.format_exc())
