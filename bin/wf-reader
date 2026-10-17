@@ -9,16 +9,20 @@ import re
 import html
 import shutil
 import textwrap
-import tempfile
 import urllib.request
 import urllib.parse
 import subprocess
 from pathlib import Path
 from html.parser import HTMLParser
 
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr"
+}
+
 
 class SemanticHTMLToMarkdown(HTMLParser):
-    def __init__(self, base_url=""):
+    def __init__(self, base_url="", keep_nav_links=False):
         super().__init__()
         self.base_url = base_url
         self.output = []
@@ -26,9 +30,11 @@ class SemanticHTMLToMarkdown(HTMLParser):
         self.in_title = False
         self.in_pre = False
         self.ignored_tags = {
-            "script", "style", "nav", "footer", "header", "aside",
-            "noscript", "iframe", "svg", "button", "form", "figure", "figcaption"
+            "script", "style", "footer", "aside",
+            "noscript", "iframe", "svg", "button", "form"
         }
+        if not keep_nav_links:
+            self.ignored_tags.update({"nav", "header", "figure", "figcaption"})
         self.ignore_stack = []
         self.current_href = None
         self.current_link_text = []
@@ -36,24 +42,33 @@ class SemanticHTMLToMarkdown(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
         tag_lower = tag.lower()
+        is_void = tag_lower in VOID_TAGS
 
         if self.ignore_stack:
-            self.ignore_stack.append(tag_lower)
+            if not is_void:
+                self.ignore_stack.append(tag_lower)
             return
 
         if tag_lower in self.ignored_tags:
-            self.ignore_stack.append(tag_lower)
+            if not is_void:
+                self.ignore_stack.append(tag_lower)
             return
 
-        class_id = (attrs_dict.get("class", "") + " " + attrs_dict.get("id", "") + " " + attrs_dict.get("role", "")).lower()
+        class_id = (
+            attrs_dict.get("class", "") + " " +
+            attrs_dict.get("id", "") + " " +
+            attrs_dict.get("role", "")
+        ).lower()
         noise_tokens = [
-            "advert", "sidebar", "cookie", "consent", "footer", "nav", "menu",
-            "mw-editsection", "reflist", "reference", "infobox", "catlinks",
-            "toc", "vector-header", "vector-page-toolbar", "vector-column-start",
-            "mw-jump-link", "printfooter", "noprint", "ambox", "hatnote"
+            "advert", "sidebar", "cookie", "consent", "footer", "menu",
+            "mw-editsection", "reflist", "reference", "catlinks",
+            "vector-header", "vector-page-toolbar", "vector-column-start",
+            "mw-jump-link", "printfooter", "noprint", "ambox", "hatnote",
+            "navbox", "sisterproject"
         ]
         if any(tok in class_id for tok in noise_tokens):
-            self.ignore_stack.append(tag_lower)
+            if not is_void:
+                self.ignore_stack.append(tag_lower)
             return
 
         if tag_lower == "title":
@@ -61,14 +76,18 @@ class SemanticHTMLToMarkdown(HTMLParser):
         elif tag_lower in ["h1", "h2", "h3", "h4", "h5", "h6"]:
             level = int(tag_lower[1])
             self.output.append(f"\n\n{'#' * level} ")
-        elif tag_lower == "p":
+        elif tag_lower in ["p", "div", "section", "article"]:
             self.output.append("\n\n")
         elif tag_lower == "blockquote":
             self.output.append("\n\n> ")
         elif tag_lower == "br":
             self.output.append("\n")
-        elif tag_lower == "li":
+        elif tag_lower in ["li", "dt", "dd"]:
             self.output.append("\n* ")
+        elif tag_lower in ["tr"]:
+            self.output.append("\n")
+        elif tag_lower in ["td", "th"]:
+            self.output.append("  ")
         elif tag_lower in ["strong", "b"]:
             self.output.append(" **")
         elif tag_lower in ["em", "i"]:
@@ -86,12 +105,24 @@ class SemanticHTMLToMarkdown(HTMLParser):
 
     def handle_endtag(self, tag):
         tag_lower = tag.lower()
+        if tag_lower in VOID_TAGS:
+            return
+
         if self.ignore_stack:
-            self.ignore_stack.pop()
+            # Pop matching tag or top of stack safely
+            if tag_lower in self.ignore_stack:
+                while self.ignore_stack:
+                    popped = self.ignore_stack.pop()
+                    if popped == tag_lower:
+                        break
+            else:
+                self.ignore_stack.pop()
             return
 
         if tag_lower == "title":
             self.in_title = False
+        elif tag_lower in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            self.output.append("\n\n")
         elif tag_lower in ["strong", "b"]:
             self.output.append("** ")
         elif tag_lower in ["em", "i"]:
@@ -103,8 +134,7 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.output.append("\n```\n\n")
         elif tag_lower == "a" and self.current_href:
             link_text = " ".join("".join(self.current_link_text).split()).strip()
-            # Ignore "[edit]" or numeric footnote markers like "[1]"
-            if link_text and not re.match(r"^\[?\d+\]?$", link_text) and link_text.lower() != "edit":
+            if link_text and not re.match(r"^\[?\d+\]?$", link_text) and link_text.lower() not in ("edit", "edit source"):
                 self.output.append(f" [{link_text}]({self.current_href}) ")
             elif link_text:
                 self.output.append(f" {link_text} ")
@@ -118,7 +148,6 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.title += data
             return
         if not self.in_pre:
-            # Collapse internal HTML newlines/tabs into single spaces
             data = re.sub(r"\s+", " ", data)
         if self.current_href is not None:
             self.current_link_text.append(data)
@@ -134,10 +163,6 @@ class SemanticHTMLToMarkdown(HTMLParser):
 
 
 def format_links_for_reading(md_text: str, base_url: str):
-    """
-    Replaces inline [Text](https://long-url) with clean readable 'Text [N]'
-    so raw URLs never clutter the prose, while storing (N, Text, URL) for navigation.
-    """
     links = []
     counter = 0
 
@@ -147,7 +172,7 @@ def format_links_for_reading(md_text: str, base_url: str):
         href = match.group(2).strip()
         if not text or href.startswith(("#", "javascript:")):
             return text
-        if re.match(r"^\[?\d+\]?$", text) or text.lower() == "edit":
+        if re.match(r"^\[?\d+\]?$", text) or text.lower() in ("edit", "edit source"):
             return ""
         full_url = urllib.parse.urljoin(base_url, href)
         counter += 1
@@ -160,9 +185,6 @@ def format_links_for_reading(md_text: str, base_url: str):
 
 
 def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> str:
-    """
-    Typesets clean Markdown into a padded, word-wrapped ANSI terminal layout.
-    """
     term_w = shutil.get_terminal_size((100, 30)).columns
     width = min(88, max(60, term_w - 8))
     pad = "    "
@@ -177,26 +199,21 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
     MAGENTA = "\033[35m"
 
     def style_inline(line: str) -> str:
-        # Reference numbers `[12]` -> yellow dim
         line = re.sub(r"`\[(\d+)\]`", f"{YELLOW}[\\1]{RESET}", line)
-        # Inline code `code` -> magenta
         line = re.sub(r"`([^`]+)`", f"{MAGENTA}\\1{RESET}", line)
-        # Bold **text** -> cyan bold (links & emphasis)
         line = re.sub(r"\*\*([^*]+)\*\*", f"{BOLD}{CYAN}\\1{RESET}", line)
-        # Italic *text*
         line = re.sub(r"\*([^*]+)\*", f"{ITALIC}\\1{RESET}", line)
         return line
 
     out = []
     out.append("")
     out.append(f"{pad}{BOLD}{CYAN}┏{'━' * (width - 2)}┓{RESET}")
-    for t_line in textwrap.wrap(title, width=width - 6):
+    for t_line in textwrap.wrap(title, width=width - 6) or [title]:
         out.append(f"{pad}{BOLD}{CYAN}┃{RESET}  {BOLD}{t_line.ljust(width - 6)}{RESET}  {BOLD}{CYAN}┃{RESET}")
     out.append(f"{pad}{BOLD}{CYAN}┗{'━' * (width - 2)}┛{RESET}")
     out.append(f"{pad}{DIM}Source: {url}{RESET}")
     out.append(f"{pad}{DIM}{'─' * width}{RESET}\n")
 
-    in_code = False
     paragraphs = md_text.split("\n\n")
 
     for block in paragraphs:
@@ -214,13 +231,15 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
             out.append(f"{pad}{DIM}└{'─' * (width - 2)}┘{RESET}\n")
             continue
 
-        # Headings
         if block.startswith("#"):
-            m = re.match(r"^(#+)\s*(.*)", block)
+            m = re.match(r"^(#+)\s*(.*)", block, re.DOTALL)
             if m:
                 level = len(m.group(1))
-                h_text = re.sub(r"\*\*([^*]+)\*\*", r"\1", m.group(2))
+                h_text = " ".join(m.group(2).split())
+                h_text = re.sub(r"\*\*([^*]+)\*\*", r"\1", h_text)
                 h_text = re.sub(r"`\[\d+\]`", "", h_text).strip()
+                if not h_text:
+                    continue
                 if level == 1:
                     out.append(f"\n{pad}{BOLD}{GREEN}██ {h_text.upper()}{RESET}")
                     out.append(f"{pad}{GREEN}{'═' * min(len(h_text) + 3, width)}{RESET}\n")
@@ -231,10 +250,11 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
                     out.append(f"\n{pad}{BOLD}{YELLOW}• {h_text}{RESET}\n")
                 continue
 
-        # Bullet lists
         if block.startswith("* ") or block.startswith("- "):
             for item in block.splitlines():
                 item_clean = re.sub(r"^[\*\-]\s+", "", item.strip())
+                if not item_clean:
+                    continue
                 wrapped = textwrap.wrap(item_clean, width=width - 4)
                 for idx, wline in enumerate(wrapped):
                     prefix = f"{pad}  {CYAN}•{RESET} " if idx == 0 else f"{pad}    "
@@ -242,7 +262,6 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
             out.append("")
             continue
 
-        # Blockquotes
         if block.startswith(">"):
             q_clean = re.sub(r"^>\s*", "", block, flags=re.MULTILINE)
             for wline in textwrap.wrap(q_clean, width=width - 4):
@@ -250,14 +269,13 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
             out.append("")
             continue
 
-        # Standard prose paragraph
         wrapped = textwrap.wrap(block, width=width)
         for wline in wrapped:
             out.append(f"{pad}{style_inline(wline)}")
         out.append("")
 
     if links:
-        out.append(f"\n{pad}{BOLD}{CYAN}▌ Hyperlink Reference Index (Type 1..{len(links)} after reading){RESET}")
+        out.append(f"\n{pad}{BOLD}{CYAN}▌ Hyperlink Reference Index (Type 1..{len(links)}){RESET}")
         out.append(f"{pad}{DIM}{'─' * width}{RESET}")
         for num, ltext, lurl in links[:60]:
             short_t = (ltext[:32] + "…") if len(ltext) > 33 else ltext
@@ -271,6 +289,11 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list) -> 
 
 
 def extract_content(url: str):
+    # Redirect bare www.wikipedia.org splash portal to English Main_Page
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc in ("www.wikipedia.org", "wikipedia.org") and parsed.path in ("", "/"):
+        url = "https://en.wikipedia.org/wiki/Main_Page"
+
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
     }
@@ -278,7 +301,6 @@ def extract_content(url: str):
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw_html = resp.read().decode("utf-8", errors="replace")
 
-    # 1. Try trafilatura first if available
     try:
         import trafilatura
         extracted = trafilatura.extract(
@@ -287,35 +309,41 @@ def extract_content(url: str):
             include_tables=False,
             output_format="markdown"
         )
-        if extracted and len(extracted) > 300:
+        if extracted and len(extracted) > 400:
             meta = trafilatura.extract_metadata(raw_html)
             title = (meta.title if meta and meta.title else None) or url
             md_clean, links = format_links_for_reading(extracted, url)
-            return md_clean, title, links
+            return md_clean, title, links, url
     except ImportError:
         pass
 
-    # 2. Scope to <article>, <main>, or #mw-content-text if present to avoid site chrome
     body_html = raw_html
     for pattern in [
         r'<div[^>]+id=["\']mw-content-text["\'][^>]*>(.*?)<div class=["\']printfooter["\']',
-        r'<article[^>]*>(.*?)</article>',
-        r'<main[^>]*>(.*?)</main>'
+        r'<main[^>]*>(.*?)</main>',
+        r'<article[^>]*>(.*?)</article>'
     ]:
         m = re.search(pattern, raw_html, re.DOTALL | re.IGNORECASE)
-        if m and len(m.group(1)) > 500:
+        if m and len(m.group(1)) > 400:
             body_html = m.group(1)
             break
 
     title_m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.DOTALL | re.IGNORECASE)
     doc_title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1)).strip()) if title_m else url
 
-    parser = SemanticHTMLToMarkdown(base_url=url)
+    parser = SemanticHTMLToMarkdown(base_url=url, keep_nav_links=False)
     parser.feed(body_html)
     raw_md, parsed_title = parser.get_markdown()
+
+    # Fallback: if page is a link hub / portal with very little prose, re-parse keeping nav links
+    if len(raw_md) < 200:
+        parser2 = SemanticHTMLToMarkdown(base_url=url, keep_nav_links=True)
+        parser2.feed(raw_html)
+        raw_md, parsed_title = parser2.get_markdown()
+
     final_title = parsed_title or doc_title
     md_clean, links = format_links_for_reading(raw_md, url)
-    return md_clean, final_title, links
+    return md_clean, final_title, links, url
 
 
 def bookmark(url: str, title: str):
@@ -394,7 +422,7 @@ def main():
 
     print(f"[*] Extracting & typesetting: {url}...")
     try:
-        md_text, title, links = extract_content(url)
+        md_text, title, links, url = extract_content(url)
         if not title:
             title = url
         run_interactive_reader(url, title, md_text, links)

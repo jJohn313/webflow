@@ -187,6 +187,48 @@ def load_bookmarks():
     return bms
 
 
+def load_rules():
+    config_paths = [
+        Path(__file__).resolve().parent.parent / "config" / "rules.conf",
+        Path.home() / ".config" / "webflow" / "rules.conf"
+    ]
+    tier1_rules, tier3_rules = [], []
+    for path in config_paths:
+        if not path.exists():
+            continue
+        active_sec = None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line == "[TIER1_ONLY]":
+                    active_sec = "TIER1"
+                elif line == "[TIER3_ONLY]":
+                    active_sec = "TIER3"
+                elif active_sec == "TIER1" and line not in tier1_rules:
+                    tier1_rules.append(line)
+                elif active_sec == "TIER3" and line not in tier3_rules:
+                    tier3_rules.append(line)
+        except Exception:
+            pass
+    return tier1_rules, tier3_rules
+
+
+def matches_rule(url: str, rules: list) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    target = f"{parsed.netloc}{parsed.path}"
+    for rule in rules:
+        if rule in target:
+            return True
+        try:
+            if re.search(rule, target, re.IGNORECASE):
+                return True
+        except re.error:
+            pass
+    return False
+
+
 class WebflowTUI:
     def set_cursor(self, visibility: int):
         try:
@@ -234,6 +276,7 @@ class WebflowTUI:
         self.workbenches = load_workbenches()
         self.history = load_history()
         self.bookmarks = load_bookmarks()
+        self.tier1_rules, self.tier3_rules = load_rules()
 
     def run(self):
         self.stdscr.nodelay(False)
@@ -438,8 +481,15 @@ class WebflowTUI:
             snippet = sel_item.get("snippet", "")
             domain = sel_item.get("domain", "")
 
-            # Predict tier
-            tier = "Tier 1: Terminal Markdown" if any(k in url for k in ["wiki", "blog", "news", "text"]) else "Tier 3: WebKitGTK Canvas"
+            # Predict tier using actual config rules and heuristics
+            if matches_rule(url, self.tier1_rules):
+                tier = "Tier 1: Terminal Markdown (Rule Match)"
+            elif matches_rule(url, self.tier3_rules):
+                tier = "Tier 3: WebKitGTK Canvas (Rule Match)"
+            elif any(k in url.lower() for k in ["wiki", "blog", "news", "text", "doc"]):
+                tier = "Tier 1: Terminal Markdown (Heuristic)"
+            else:
+                tier = "Tier 3: WebKitGTK Canvas (Interactive)"
 
             self.safe_addstr(py + 2, px + 2, "Title:", curses.color_pair(1) | curses.A_BOLD)
             self.safe_addstr(py + 3, px + 2, title[:pw - 4], curses.color_pair(7))
