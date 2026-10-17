@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+wf-view - Tier 3: In-House Modal WebKitGTK Browser for Webflow
+High-performance, chromeless, single-process Wayland client with Vim modal navigation.
+"""
+
+import os
+import sys
+import json
+import urllib.parse
+import subprocess
+from pathlib import Path
+
+# Ensure Wayland backend for GTK
+os.environ.setdefault("GDK_BACKEND", "wayland,x11")
+
+import gi
+try:
+    gi.require_version("WebKit2", "4.1")
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk, GLib, WebKit2 as WebKit
+except ValueError:
+    try:
+        gi.require_version("WebKit", "6.0")
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, Gdk, GLib, WebKit
+    except ValueError as e:
+        sys.stderr.write(f"Error loading WebKitGTK: {e}\n")
+        sys.exit(1)
+
+
+def extract_root_domain(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.netloc.split(":")[0].lower()
+    if not netloc:
+        return "local"
+    parts = netloc.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return netloc
+
+
+class WebflowViewer(Gtk.Window):
+    def __init__(self, initial_url: str):
+        super().__init__()
+        self.initial_url = initial_url if "://" in initial_url else f"https://{initial_url}"
+        self.root_domain = extract_root_domain(self.initial_url)
+        self.mode = "NORMAL"  # NORMAL | INSERT | HINTS
+        self.pending_g = False
+
+        # Paths
+        self.base_share = Path.home() / ".local" / "share" / "webflow"
+        self.session_dir = self.base_share / "sessions" / self.root_domain
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.bookmarks_file = self.base_share / "bookmarks.txt"
+        self.hints_script_path = Path(__file__).resolve().parent.parent / "assets" / "hints.js"
+
+        self.setup_window()
+        self.setup_engine()
+        self.setup_keybindings()
+
+        self.load_url(self.initial_url)
+
+    def setup_window(self):
+        self.set_title(f"wf-view [{self.mode}] - {self.root_domain}")
+        self.set_default_size(1280, 800)
+        self.set_decorated(False)
+        self.connect("destroy", self.on_quit)
+
+    def setup_engine(self):
+        # Configure isolated session
+        data_manager = WebKit.WebsiteDataManager(
+            base_data_directory=str(self.session_dir),
+            base_cache_directory=str(self.session_dir / "cache"),
+            local_storage_directory=str(self.session_dir / "localstorage"),
+            disk_cache_directory=str(self.session_dir / "diskcache")
+        )
+
+        cookie_manager = data_manager.get_cookie_manager()
+        cookie_manager.set_persistent_storage(
+            str(self.session_dir / "cookies.sqlite"),
+            WebKit.CookiePersistentStorage.SQLITE
+        )
+
+        web_context = WebKit.WebContext.new_with_website_data_manager(data_manager)
+
+        # Message handler for JavaScript -> Python IPC
+        self.ucm = WebKit.UserContentManager()
+        self.ucm.register_script_message_handler("webflow")
+        self.ucm.connect("script-message-received::webflow", self.on_js_message)
+
+        # Auto-focus listener script to update modal state
+        focus_observer_js = """
+        (function() {
+            window.addEventListener('focusin', function(e) {
+                var el = e.target;
+                if (!el) return;
+                var tag = (el.tagName || '').toLowerCase();
+                var isEditable = el.isContentEditable || tag === 'textarea' ||
+                    (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
+                if (isEditable && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+                    window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'INSERT'}));
+                }
+            }, true);
+
+            window.addEventListener('focusout', function(e) {
+                var el = e.target;
+                if (!el) return;
+                var tag = (el.tagName || '').toLowerCase();
+                var isEditable = el.isContentEditable || tag === 'textarea' ||
+                    (tag === 'input' && !['checkbox','radio','button','submit','reset','hidden'].includes(el.type));
+                if (isEditable && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+                    window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'NORMAL'}));
+                }
+            }, true);
+        })();
+        """
+        user_script = WebKit.UserScript(
+            source=focus_observer_js,
+            injected_frames=WebKit.UserContentInjectedFrames.ALL_FRAMES,
+            injection_time=WebKit.UserScriptInjectionTime.END,
+            whitelist=[],
+            blacklist=[]
+        )
+        self.ucm.add_script(user_script)
+
+        self.web_view = WebKit.WebView.new_with_context(web_context)
+        # Apply user content manager
+        if hasattr(self.web_view, "set_user_content_manager"):
+            self.web_view.set_user_content_manager(self.ucm)
+
+        # Settings
+        settings = self.web_view.get_settings()
+        settings.set_enable_developer_extras(False)
+        settings.set_enable_smooth_scrolling(True)
+        settings.set_javascript_can_open_windows_automatically(False)
+
+        self.web_view.connect("notify::title", self.on_title_changed)
+        self.web_view.connect("notify::uri", self.on_uri_changed)
+
+        self.add(self.web_view)
+        self.show_all()
+
+    def eval_js(self, script: str):
+        if hasattr(self.web_view, "evaluate_javascript"):
+            self.web_view.evaluate_javascript(script, -1, None, None, None, None, None)
+        else:
+            self.web_view.run_javascript(script, None, None, None)
+
+    def load_url(self, url: str):
+        self.web_view.load_uri(url)
+
+    def update_title(self):
+        page_title = self.web_view.get_title() or self.root_domain
+        self.set_title(f"wf-view [{self.mode}] {page_title}")
+
+    def on_title_changed(self, view, param):
+        self.update_title()
+
+    def on_uri_changed(self, view, param):
+        uri = self.web_view.get_uri() or ""
+        new_domain = extract_root_domain(uri)
+        if new_domain != self.root_domain:
+            self.root_domain = new_domain
+        self.update_title()
+
+    def on_js_message(self, manager, js_result):
+        try:
+            val = js_result.get_value().to_string()
+            data = json.loads(val) if val.startswith("{") else {"action": "set_mode", "mode": val}
+            action = data.get("action")
+            if action == "set_mode":
+                self.mode = data.get("mode", "NORMAL")
+                self.update_title()
+            elif action == "hints_dismissed":
+                if self.mode == "HINTS":
+                    self.mode = "NORMAL"
+                    self.update_title()
+        except Exception:
+            pass
+
+    def setup_keybindings(self):
+        self.connect("key-press-event", self.on_key_press)
+
+    def on_key_press(self, widget, event):
+        keyname = Gdk.keyval_name(event.keyval)
+        if not keyname:
+            return False
+
+        # Global Escape: always drop to NORMAL mode and blur inputs
+        if keyname == "Escape":
+            self.mode = "NORMAL"
+            self.pending_g = False
+            self.eval_js("if (document.activeElement) document.activeElement.blur(); if (window.__wf_cleanup_hints) window.__wf_cleanup_hints();")
+            self.update_title()
+            return True
+
+        if self.mode == "INSERT":
+            return False  # Let GTK/WebKit process input normally
+
+        if self.mode == "HINTS":
+            return False  # Let injected hints.js capture keystrokes
+
+        # NORMAL MODE KEYBINDINGS
+        if keyname == "j":
+            self.eval_js("window.scrollBy({top: 100, behavior: 'smooth'});")
+            return True
+        elif keyname == "k":
+            self.eval_js("window.scrollBy({top: -100, behavior: 'smooth'});")
+            return True
+        elif keyname == "d":
+            self.eval_js("window.scrollBy({top: window.innerHeight * 0.5, behavior: 'smooth'});")
+            return True
+        elif keyname == "u":
+            self.eval_js("window.scrollBy({top: -window.innerHeight * 0.5, behavior: 'smooth'});")
+            return True
+        elif keyname == "g":
+            if self.pending_g:
+                self.eval_js("window.scrollTo({top: 0, behavior: 'smooth'});")
+                self.pending_g = False
+            else:
+                self.pending_g = True
+            return True
+        elif keyname == "G":
+            self.eval_js("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
+            return True
+        elif keyname == "H":
+            if self.web_view.can_go_back():
+                self.web_view.go_back()
+            return True
+        elif keyname == "L":
+            if self.web_view.can_go_forward():
+                self.web_view.go_forward()
+            return True
+        elif keyname == "r":
+            self.web_view.reload()
+            return True
+        elif keyname == "b":
+            self.bookmark_current()
+            return True
+        elif keyname == "y":
+            self.copy_url_to_clipboard()
+            return True
+        elif keyname == "q":
+            self.on_quit()
+            return True
+        elif keyname == "i":
+            self.mode = "INSERT"
+            self.update_title()
+            return True
+        elif keyname == "f":
+            self.trigger_hints()
+            return True
+
+        self.pending_g = False
+        return False
+
+    def trigger_hints(self):
+        if not self.hints_script_path.exists():
+            return
+        try:
+            hints_js = self.hints_script_path.read_text(encoding="utf-8")
+            self.mode = "HINTS"
+            self.update_title()
+            self.eval_js(hints_js)
+        except Exception as e:
+            sys.stderr.write(f"Failed to inject hints: {e}\n")
+
+    def bookmark_current(self):
+        uri = self.web_view.get_uri() or self.initial_url
+        title = self.web_view.get_title() or self.root_domain
+        self.bookmarks_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.bookmarks_file, "a", encoding="utf-8") as f:
+            f.write(f"{uri} | {title}\n")
+        print(f"[wf-view] Bookmarked: {uri}")
+
+    def copy_url_to_clipboard(self):
+        uri = self.web_view.get_uri() or self.initial_url
+        try:
+            proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+            proc.communicate(input=uri.encode("utf-8"))
+            print(f"[wf-view] Copied URL to clipboard: {uri}")
+        except FileNotFoundError:
+            # Fallback to Gtk clipboard
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text(uri, -1)
+
+    def on_quit(self, *args):
+        Gtk.main_quit()
+        sys.exit(0)
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: wf-view <url>\n")
+        sys.exit(1)
+
+    target_url = sys.argv[1].strip()
+    app = WebflowViewer(target_url)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""
+wf-open - Entry Dispatcher & Heuristic Classifier for Webflow
+Directs incoming URLs to either Tier 1 (wf-reader) or Tier 3 (wf-view) based on rules and fast content probing.
+"""
+
+import os
+import sys
+import re
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+def load_rules():
+    config_paths = [
+        Path.home() / ".config" / "webflow" / "rules.conf",
+        Path(__file__).resolve().parent.parent / "config" / "rules.conf"
+    ]
+    tier1_rules = []
+    tier3_rules = []
+
+    active_section = None
+    for path in config_paths:
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line == "[TIER1_ONLY]":
+                        active_section = "TIER1"
+                        continue
+                    elif line == "[TIER3_ONLY]":
+                        active_section = "TIER3"
+                        continue
+
+                    if active_section == "TIER1":
+                        tier1_rules.append(line)
+                    elif active_section == "TIER3":
+                        tier3_rules.append(line)
+                break
+            except Exception as e:
+                sys.stderr.write(f"Warning reading config {path}: {e}\n")
+
+    return tier1_rules, tier3_rules
+
+
+def matches_rule(url: str, rules: list) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    target = f"{parsed.netloc}{parsed.path}"
+    for rule in rules:
+        if rule in target:
+            return True
+        try:
+            if re.search(rule, target, re.IGNORECASE):
+                return True
+        except re.error:
+            pass
+    return False
+
+
+def probe_tier(url: str) -> str:
+    """
+    Fast streaming heuristic probe (max 32 KB, 2.5s timeout).
+    Determines if page is an SPA/app (Tier 3) or readable text/article (Tier 1).
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Webflow/0.1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "text/html" not in content_type and "application/xhtml" not in content_type:
+                # Binary / non-HTML payload
+                return "TIER3"
+
+            chunk = resp.read(32768).decode("utf-8", errors="replace")
+
+            # Check for Single Page Application mounting markers
+            spa_markers = [
+                r'<div[^>]+id=["\']root["\']',
+                r'<div[^>]+id=["\']app["\']',
+                r'<div[^>]+id=["\']__next["\']>\s*</div>',
+                r'<div[^>]+id=["\']__nuxt["\']>\s*</div>',
+                r'<noscript>[^<]*enable JavaScript',
+                r'<app-root'
+            ]
+            for marker in spa_markers:
+                if re.search(marker, chunk, re.IGNORECASE):
+                    return "TIER3"
+
+            # Check for substantial semantic article text
+            p_text = "".join(re.findall(r'<p[^>]*>(.*?)</p>', chunk, re.DOTALL | re.IGNORECASE))
+            article_text = "".join(re.findall(r'<article[^>]*>(.*?)</article>', chunk, re.DOTALL | re.IGNORECASE))
+            combined_text = re.sub(r'<[^>]+>', '', p_text + article_text).strip()
+
+            if len(combined_text) >= 600:
+                return "TIER1"
+            else:
+                return "TIER3"
+
+    except Exception:
+        # On network timeout or SSL/probe error, fallback to full browser
+        return "TIER3"
+
+
+def log_history(tier: str, url: str, title: str = ""):
+    history_file = Path.home() / ".local" / "share" / "webflow" / "history.txt"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    title_clean = title.strip() or urllib.parse.urlparse(url).netloc
+    with open(history_file, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp} | {tier} | {url} | {title_clean}\n")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: wf-open <url>\n")
+        sys.exit(1)
+
+    raw_url = sys.argv[1].strip()
+    if not re.match(r"^https?://", raw_url):
+        url = "https://" + raw_url
+    else:
+        url = raw_url
+
+    tier1_rules, tier3_rules = load_rules()
+
+    if matches_rule(url, tier1_rules):
+        chosen_tier = "TIER1"
+    elif matches_rule(url, tier3_rules):
+        chosen_tier = "TIER3"
+    else:
+        chosen_tier = probe_tier(url)
+
+    log_history(chosen_tier, url)
+
+    bin_dir = Path(__file__).resolve().parent
+    if chosen_tier == "TIER1":
+        reader_bin = bin_dir / "wf-reader"
+        os.execv(str(reader_bin), [str(reader_bin), url])
+    else:
+        view_bin = bin_dir / "wf-view"
+        os.execv(str(view_bin), [str(view_bin), url])
+
+
+if __name__ == "__main__":
+    main()

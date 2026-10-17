@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SHARE_DIR="${HOME}/.local/share/webflow"
+BM_FILE="${SHARE_DIR}/bookmarks.txt"
+HIST_FILE="${SHARE_DIR}/history.txt"
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WF_OPEN="${BIN_DIR}/wf-open"
+
+if [[ ! -x "${WF_OPEN}" ]]; then
+    WF_OPEN="$(which wf-open 2>/dev/null || true)"
+fi
+
+mkdir -p "${SHARE_DIR}"
+touch "${BM_FILE}" "${HIST_FILE}"
+
+# Deduplicate items preserving bookmarks first, then history
+SELECTED=$(
+    {
+        # Bookmarks: URL | TITLE
+        if [[ -s "${BM_FILE}" ]]; then
+            awk -F' \\| ' '{print "[★ Bookmark] " $0}' "${BM_FILE}"
+        fi
+        # History: TIMESTAMP | TIER | URL | TITLE
+        if [[ -s "${HIST_FILE}" ]]; then
+            tac "${HIST_FILE}" | awk -F' \\| ' '{print "[⌛ History]  " $3 " | " $4}'
+        fi
+    } | awk '!seen[$0]++' | fzf \
+        --prompt="Webflow ❯ " \
+        --header="Enter: Open in wf-open | Esc: Cancel" \
+        --layout=reverse \
+        --border=rounded \
+        --height=50% || true
+)
+
+if [[ -z "${SELECTED}" ]]; then
+    exit 0
+fi
+
+# Extract the URL from the selected line
+# format: [Prefix] URL | TITLE
+CLEANED_LINE="${SELECTED#*] }"
+TARGET_URL=$(echo "${CLEANED_LINE}" | awk -F' \\| ' '{print $1}' | tr -d '[:space:]')
+
+if [[ -n "${TARGET_URL}" ]]; then
+    exec "${WF_OPEN}" "${TARGET_URL}"
+fi

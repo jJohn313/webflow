@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+wf-reader - Tier 1: Terminal Markdown Extractor & Terminal Runner for Webflow
+Extracts semantic text from web pages into clean Markdown and renders inside a terminal reader.
+"""
+
+import os
+import sys
+import re
+import html
+import tempfile
+import urllib.request
+import urllib.parse
+import subprocess
+from pathlib import Path
+from html.parser import HTMLParser
+
+
+class SemanticHTMLToMarkdown(HTMLParser):
+    def __init__(self, base_url=""):
+        super().__init__()
+        self.base_url = base_url
+        self.output = []
+        self.title = ""
+        self.in_title = False
+        self.links = []
+        self.link_counter = 0
+
+        self.ignored_tags = {
+            "script", "style", "nav", "footer", "header", "aside",
+            "noscript", "iframe", "svg", "button", "form"
+        }
+        self.ignore_depth = 0
+        self.current_href = None
+        self.current_link_text = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        tag_lower = tag.lower()
+
+        if tag_lower in self.ignored_tags:
+            self.ignore_depth += 1
+            return
+
+        # Filter out obvious ad / navigation containers by class or id
+        class_id = (attrs_dict.get("class", "") + " " + attrs_dict.get("id", "")).lower()
+        if any(ad in class_id for ad in ["advert", "sidebar", "cookie-banner", "consent", "footer-nav"]):
+            self.ignore_depth += 1
+            return
+
+        if self.ignore_depth > 0:
+            return
+
+        if tag_lower == "title":
+            self.in_title = True
+        elif tag_lower in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            level = int(tag_lower[1])
+            self.output.append(f"\n\n{'#' * level} ")
+        elif tag_lower == "p":
+            self.output.append("\n\n")
+        elif tag_lower == "br":
+            self.output.append("\n")
+        elif tag_lower == "li":
+            self.output.append("\n* ")
+        elif tag_lower in ["strong", "b"]:
+            self.output.append("**")
+        elif tag_lower in ["em", "i"]:
+            self.output.append("*")
+        elif tag_lower == "code":
+            self.output.append("`")
+        elif tag_lower == "pre":
+            self.output.append("\n\n```\n")
+        elif tag_lower == "a":
+            href = attrs_dict.get("href")
+            if href:
+                full_url = urllib.parse.urljoin(self.base_url, href)
+                self.current_href = full_url
+                self.current_link_text = []
+
+    def handle_endtag(self, tag):
+        tag_lower = tag.lower()
+        if tag_lower in self.ignored_tags:
+            if self.ignore_depth > 0:
+                self.ignore_depth -= 1
+            return
+
+        if self.ignore_depth > 0:
+            return
+
+        if tag_lower == "title":
+            self.in_title = False
+        elif tag_lower in ["strong", "b"]:
+            self.output.append("**")
+        elif tag_lower in ["em", "i"]:
+            self.output.append("*")
+        elif tag_lower == "code":
+            self.output.append("`")
+        elif tag_lower == "pre":
+            self.output.append("\n```\n")
+        elif tag_lower == "a" and self.current_href:
+            link_text = "".join(self.current_link_text).strip()
+            if link_text:
+                self.link_counter += 1
+                self.links.append((self.link_counter, link_text, self.current_href))
+                self.output.append(f"[{link_text}]({self.current_href}) `[{self.link_counter}]`")
+            self.current_href = None
+            self.current_link_text = []
+
+    def handle_data(self, data):
+        if self.ignore_depth > 0:
+            return
+        if self.in_title:
+            self.title += data
+            return
+        if self.current_href is not None:
+            self.current_link_text.append(data)
+        else:
+            self.output.append(data)
+
+    def get_markdown(self):
+        text = "".join(self.output)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text, self.title.strip(), self.links
+
+
+def extract_content(url: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Webflow/0.1.0"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw_html = resp.read().decode("utf-8", errors="replace")
+
+    # Optional trafilatura integration if installed
+    try:
+        import trafilatura
+        extracted = trafilatura.extract(raw_html, include_links=True, output_format="markdown")
+        if extracted and len(extracted) > 300:
+            title = trafilatura.core.extract_metadata(raw_html).title or url
+            return extracted, title, []
+    except ImportError:
+        pass
+
+    # Built-in semantic extractor
+    parser = SemanticHTMLToMarkdown(base_url=url)
+    parser.feed(raw_html)
+    return parser.get_markdown()
+
+
+def bookmark(url: str, title: str):
+    bm_file = Path.home() / ".local" / "share" / "webflow" / "bookmarks.txt"
+    bm_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(bm_file, "a", encoding="utf-8") as f:
+        f.write(f"{url} | {title}\n")
+    print(f"\n[✔] Bookmarked: {url} | {title}")
+
+
+def run_interactive_reader(url: str, title: str, md_text: str, links: list):
+    # Write temporary file
+    temp_md = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8")
+    header = f"# {title}\n\n**Source**: [{url}]({url})\n\n---\n\n"
+    temp_md.write(header + md_text)
+    temp_md.close()
+
+    try:
+        # Check glow or less
+        has_glow = subprocess.run(["which", "glow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if has_glow:
+            subprocess.run(["glow", "-p", temp_md.name])
+        else:
+            subprocess.run(["less", "-R", temp_md.name])
+    finally:
+        pass
+
+    # Post-read modal action prompt
+    print("\n" + "=" * 60)
+    print(f"📖 Webflow Reader: {title}")
+    print("=" * 60)
+    print("Actions:")
+    print("  [E]       Escalate to GUI viewer (wf-view)")
+    print("  [b]       Bookmark page")
+    print("  [1..N]    Open referenced link number in wf-open")
+    print("  [q/Enter] Quit reader")
+    print("-" * 60)
+
+    try:
+        choice = input("wf-reader > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = "q"
+
+    if choice.lower() == "e":
+        wf_view_bin = Path(__file__).resolve().parent / "wf-view"
+        os.execv(str(wf_view_bin), [str(wf_view_bin), url])
+    elif choice.lower() == "b":
+        bookmark(url, title)
+    elif choice.isdigit():
+        num = int(choice)
+        match = [l for l in links if l[0] == num]
+        if match:
+            target_link = match[0][2]
+            wf_open_bin = Path(__file__).resolve().parent / "wf-open"
+            os.execv(str(wf_open_bin), [str(wf_open_bin), target_link])
+        else:
+            print("Invalid link reference number.")
+    elif choice.lower() == "q" or not choice:
+        pass
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: wf-reader <url>\n")
+        sys.exit(1)
+
+    url = sys.argv[1].strip()
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+
+    print(f"[*] Extracting article text from: {url}...")
+    try:
+        md_text, title, links = extract_content(url)
+        if not title:
+            title = url
+        run_interactive_reader(url, title, md_text, links)
+    except Exception as e:
+        sys.stderr.write(f"[!] Reader extraction failed: {e}\n")
+        print("[*] Escalating to Tier 3 (wf-view)...")
+        wf_view_bin = Path(__file__).resolve().parent / "wf-view"
+        os.execv(str(wf_view_bin), [str(wf_view_bin), url])
+
+
+if __name__ == "__main__":
+    main()

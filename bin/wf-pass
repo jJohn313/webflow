@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+"""
+wf-pass - Active-Window Credential Injector for Webflow
+Synthesizes credentials via wtype into active wf-view window using pass or rbw.
+"""
+set -euo pipefail
+
+# 1. Detect active window details
+WINDOW_INFO=""
+if command -v hyprctl >/dev/null 2>&1; then
+    WINDOW_INFO="$(hyprctl activewindow -j 2>/dev/null || true)"
+fi
+
+DOMAIN=""
+if [[ -n "${WINDOW_INFO}" ]]; then
+    # Parse title or class
+    TITLE=$(echo "${WINDOW_INFO}" | grep -o '"title": "[^"]*"' | cut -d'"' -f4 || true)
+    # Extract domain pattern e.g. domain.com or from wf-view [NORMAL] domain.com
+    DOMAIN=$(echo "${TITLE}" | grep -oE '([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}' | head -n1 || true)
+fi
+
+# Fallback: prompt user for domain if not automatically detected
+if [[ -z "${DOMAIN}" ]]; then
+    if command -v rofi >/dev/null 2>&1; then
+        DOMAIN=$(rofi -dmenu -p "Login domain: " || true)
+    else
+        read -r -p "Target domain for credentials: " DOMAIN
+    fi
+fi
+
+if [[ -z "${DOMAIN}" ]]; then
+    echo "[-] No domain detected or specified."
+    exit 1
+fi
+
+echo "[*] Searching credentials for domain: ${DOMAIN}"
+
+USER=""
+PASS=""
+
+# 2. Try rbw (Bitwarden CLI)
+if command -v rbw >/dev/null 2>&1 && rbw unlocked >/dev/null 2>&1; then
+    ENTRY_ID=$(rbw search "${DOMAIN}" 2>/dev/null | head -n1 || true)
+    if [[ -n "${ENTRY_ID}" ]]; then
+        USER=$(rbw get --field username "${ENTRY_ID}" 2>/dev/null || true)
+        PASS=$(rbw get "${ENTRY_ID}" 2>/dev/null || true)
+    fi
+fi
+
+# 3. Try pass (standard unix password store) if rbw didn't return
+if [[ -z "${PASS}" ]] && command -v pass >/dev/null 2>&1; then
+    PASS_ENTRY=$(pass find "${DOMAIN}" 2>/dev/null | grep -v 'Search terms' | head -n1 | sed 's/^[├── └── ]*//' || true)
+    if [[ -n "${PASS_ENTRY}" ]]; then
+        PASS=$(pass show "${PASS_ENTRY}" 2>/dev/null | head -n1 || true)
+        USER=$(pass show "${PASS_ENTRY}" 2>/dev/null | grep -iE '^(user|username|login):' | cut -d':' -f2- | tr -d ' ' || true)
+    fi
+fi
+
+if [[ -z "${PASS}" ]]; then
+    echo "[-] No matching credentials found in rbw or pass for ${DOMAIN}."
+    exit 1
+fi
+
+# 4. Inject credentials using wtype
+if ! command -v wtype >/dev/null 2>&1; then
+    echo "[-] wtype utility is required for keystroke synthesis."
+    exit 1
+fi
+
+echo "[*] Injecting credentials into active window..."
+# Small sleep to ensure window focus has settled
+sleep 0.1
+
+if [[ -n "${USER}" ]]; then
+    wtype -s 20 "${USER}"
+    wtype -k Tab
+    sleep 0.05
+fi
+
+wtype -s 20 "${PASS}"
+wtype -k Return
+
+echo "[✔] Credentials synthesized successfully."
