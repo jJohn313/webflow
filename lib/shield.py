@@ -81,9 +81,9 @@ def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_sha
     Applies persistent disk/memory caching (WEB_BROWSER model), disables ITP partitioning so SSO
     logins (Google, GitHub, etc.) persist across apps, and compiles native WebKit bytecode filters.
     """
-    # 1. Enable full Web Browser cache model for fast load times and persistent bundle storage
+    # 1. Use DOCUMENT_BROWSER cache model: keeps full disk cache capacity while capping RAM (0 dead pages in RAM)
     try:
-        web_context.set_cache_model(WebKit.CacheModel.WEB_BROWSER)
+        web_context.set_cache_model(WebKit.CacheModel.DOCUMENT_BROWSER)
     except Exception:
         pass
 
@@ -102,8 +102,9 @@ def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_sha
         pass
 
     # 3. WebKitSettings configuration for modern rich SPAs (Gemini, GitHub, etc.)
+    # In-memory page cache keeps dead pages frozen in RAM; disabling it relies on the fast 200MB NVMe disk cache
     if hasattr(settings, "set_enable_page_cache"):
-        settings.set_enable_page_cache(True)
+        settings.set_enable_page_cache(False)
     if hasattr(settings, "set_enable_offline_web_application_cache"):
         settings.set_enable_offline_web_application_cache(True)
     if hasattr(settings, "set_enable_hyperlink_auditing"):

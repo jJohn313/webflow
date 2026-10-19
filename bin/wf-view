@@ -13,6 +13,7 @@ import argparse
 import urllib.parse
 import subprocess
 import base64
+import threading
 from pathlib import Path
 
 # Fix WebKitGTK DMA-BUF / EGL crash on Wayland (Hyprland + Nvidia/Mesa)
@@ -49,6 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from lib.vault import WebflowVault
 from lib.shield import apply_shield_and_ram_diet
+from lib.cache_manager import enforce_lru_cache_quota
 
 
 def extract_root_domain(url: str) -> str:
@@ -113,8 +115,13 @@ class WebflowViewer(Gtk.Window):
         if self.workbench:
             safe_wb = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.workbench.strip())
             self.wb_manifest = self.base_share / "workbenches" / f"{safe_wb}.json"
+            self.cache_dir = self.storage_dir / "cache" / "workbenches" / safe_wb
+            self.cache_quota_mb = 200
         else:
             self.wb_manifest = None
+            self.cache_dir = self.storage_dir / "cache" / "ephemeral"
+            self.cache_quota_mb = 150
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.bookmarks_file = self.base_share / "bookmarks.txt"
         self.hints_script_path = REPO_ROOT / "assets" / "hints.js"
@@ -262,7 +269,7 @@ class WebflowViewer(Gtk.Window):
         try:
             self.data_manager = WebKit.WebsiteDataManager(
                 base_data_directory=str(self.storage_dir / "data"),
-                base_cache_directory=str(self.storage_dir / "cache")
+                base_cache_directory=str(self.cache_dir)
             )
             self.web_context = WebKit.WebContext.new_with_website_data_manager(self.data_manager)
             cookie_manager = self.data_manager.get_cookie_manager()
@@ -276,6 +283,13 @@ class WebflowViewer(Gtk.Window):
             WebKit.CookiePersistentStorage.SQLITE
         )
         cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+
+        # Enforce LRU cache quota in background thread
+        threading.Thread(
+            target=enforce_lru_cache_quota,
+            args=(self.cache_dir, self.cache_quota_mb),
+            daemon=True
+        ).start()
 
     def create_tab(self, url: str = None, switch_to: bool = True) -> WebKit.WebView:
         ucm = WebKit.UserContentManager()
@@ -353,6 +367,10 @@ class WebflowViewer(Gtk.Window):
         return web_view
 
     def on_notebook_switch_page(self, notebook, page, page_num):
+        for i in range(notebook.get_n_pages()):
+            p = notebook.get_nth_page(i)
+            if hasattr(p, "set_is_muted"):
+                p.set_is_muted(i != page_num)
         GLib.idle_add(self._after_tab_switch, page)
 
     def _after_tab_switch(self, page):
