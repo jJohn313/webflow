@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-lib/shield.py - Native WebKitGTK Bytecode Content Blocker, Tracker Shield & RAM Optimizer
+lib/shield.py - Native WebKitGTK Bytecode Content Blocker, Tracker Shield & Performance Optimizer
 Compiles network block rules and cosmetic CSS rules directly into WebKit's C++ engine.
+Configured for full WebGL, WebAudio, fast persistent HTTP caching, and cross-domain SSO authentication.
 """
 import json
 from pathlib import Path
@@ -15,20 +16,24 @@ WEBKIT_BLOCK_RULES = [
     {
         "trigger": {
             "url-filter": ".*",
-            "if-domain": ["*youtube.com", "*googlevideo.com"],
+            "if-domain": [
+                "*google.com", "*google.ch", "*googleusercontent.com", "*gstatic.com",
+                "*youtube.com", "*googlevideo.com", "*github.com", "*githubusercontent.com",
+                "*infomaniak.com", "*eduid.ch", "*uzh.ch"
+            ],
             "url-filter-is-case-sensitive": False
         },
         "action": {"type": "ignore-previous-rules"}
     },
     {
         "trigger": {
-            "url-filter": "(doubleclick\\.net|googlesyndication\\.com|google-analytics\\.com|googletagmanager\\.com|googletagservices\\.com|adservice\\.google\\.|pagead2\\.googlesyndication|adsystem\\.com|adnxs\\.com|rubiconproject\\.com|pubmatic\\.com|criteo\\.com|outbrain\\.com|taboola\\.com|scorecardresearch\\.com|quantserve\\.com|hotjar\\.com|mouseflow\\.com|fullstory\\.com|clarity\\.ms|mixpanel\\.com|segment\\.io|amplitude\\.com|sentry\\.io|bugsnag\\.com|newrelic\\.com|nr-data\\.net|connect\\.facebook\\.net|analytics\\.tiktok\\.com|ads-twitter\\.com)"
+            "url-filter": "(doubleclick\\.net|googlesyndication\\.com|adservice\\.google\\.|pagead2\\.googlesyndication|adsystem\\.com|adnxs\\.com|rubiconproject\\.com|pubmatic\\.com|criteo\\.com|outbrain\\.com|taboola\\.com|scorecardresearch\\.com|quantserve\\.com|hotjar\\.com|mouseflow\\.com|fullstory\\.com|clarity\\.ms|mixpanel\\.com|segment\\.io|amplitude\\.com|sentry\\.io|bugsnag\\.com|newrelic\\.com|nr-data\\.net|connect\\.facebook\\.net|analytics\\.tiktok\\.com|ads-twitter\\.com)"
         },
         "action": {"type": "block"}
     },
     {
         "trigger": {
-            "url-filter": "(/api/stats/ads|/api/stats/atr|/pagead/|/ptracking|/get_midroll_info|/collect\\?v=|/beacon/|/telemetry/|/pixel\\.|/analytics\\.js|/gtm\\.js|/fbevents\\.js)"
+            "url-filter": "(/api/stats/ads|/api/stats/atr|/pagead/|/ptracking|/get_midroll_info|/collect\\?v=|/pixel\\.|/fbevents\\.js)"
         },
         "action": {"type": "block"}
     },
@@ -55,18 +60,17 @@ ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-banner-promo-renderer,
 }
 """
 
-# Pre-document JS to neuter beacon/ping trackers and set Do-Not-Track / GPC signals
+# Pre-document JS to set Do-Not-Track and GPC privacy headers without breaking web app internal APIs
 PRIVACY_SHIELD_JS = """
 (function() {
     'use strict';
     try {
-        Object.defineProperty(navigator, 'globalPrivacyControl', { value: true, writable: false });
-        Object.defineProperty(navigator, 'doNotTrack', { value: '1', writable: false });
-        navigator.sendBeacon = function() { return true; };
-        window.ga = function() {};
-        window.gtag = function() {};
-        window.fbq = function() {};
-        window._gaq = [];
+        if (!navigator.globalPrivacyControl) {
+            Object.defineProperty(navigator, 'globalPrivacyControl', { value: true, writable: false });
+        }
+        if (!navigator.doNotTrack) {
+            Object.defineProperty(navigator, 'doNotTrack', { value: '1', writable: false });
+        }
     } catch (e) {}
 })();
 """
@@ -74,13 +78,12 @@ PRIVACY_SHIELD_JS = """
 
 def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_share: Path):
     """
-    Applies strict RAM limits, Intelligent Tracking Prevention (ITP),
-    Cosmetic CSS/JS shields, and compiles WebKit bytecode network filters.
+    Applies persistent disk/memory caching (WEB_BROWSER model), disables ITP partitioning so SSO
+    logins (Google, GitHub, etc.) persist across apps, and compiles native WebKit bytecode filters.
     """
-    # 1. Process & Cache Diet (Reduces WebKitWebProcess RAM by ~35-50%)
+    # 1. Enable full Web Browser cache model for fast load times and persistent bundle storage
     try:
-        # DOCUMENT_VIEWER keeps 0 dead pages in memory cache
-        web_context.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
+        web_context.set_cache_model(WebKit.CacheModel.WEB_BROWSER)
     except Exception:
         pass
 
@@ -90,34 +93,37 @@ def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_sha
     except Exception:
         pass
 
-    # Enable Intelligent Tracking Prevention (ITP)
+    # 2. Disable ITP (Intelligent Tracking Prevention) storage partitioning so cross-domain SSO logins
+    # (e.g. accounts.google.com -> gemini.google.com) remain valid and authenticated.
     try:
         if data_manager and hasattr(data_manager, "set_itp_enabled"):
-            data_manager.set_itp_enabled(True)
+            data_manager.set_itp_enabled(False)
     except Exception:
         pass
 
-    # 2. Strip down WebKitSettings
+    # 3. WebKitSettings configuration for modern rich SPAs (Gemini, GitHub, etc.)
     if hasattr(settings, "set_enable_page_cache"):
-        settings.set_enable_page_cache(False)
+        settings.set_enable_page_cache(True)
     if hasattr(settings, "set_enable_offline_web_application_cache"):
-        settings.set_enable_offline_web_application_cache(False)
+        settings.set_enable_offline_web_application_cache(True)
     if hasattr(settings, "set_enable_hyperlink_auditing"):
         settings.set_enable_hyperlink_auditing(False)
+    if hasattr(settings, "set_enable_webgl"):
+        settings.set_enable_webgl(True)
+    if hasattr(settings, "set_enable_webaudio"):
+        settings.set_enable_webaudio(True)
+    if hasattr(settings, "set_enable_dns_prefetching"):
+        settings.set_enable_dns_prefetching(True)
+    if hasattr(settings, "set_javascript_can_access_clipboard"):
+        settings.set_javascript_can_access_clipboard(True)
+    if hasattr(settings, "set_enable_back_forward_navigation_gestures"):
+        settings.set_enable_back_forward_navigation_gestures(False)
     if hasattr(settings, "set_enable_media_stream"):
         settings.set_enable_media_stream(False)
     if hasattr(settings, "set_enable_mediasource"):
-        settings.set_enable_mediasource(False)  # Prevents MSE YouTube crashes; video goes to mpv/youtube-tui
-    if hasattr(settings, "set_enable_webgl"):
-        settings.set_enable_webgl(False)        # Huge GPU/RAM savings; toggleable if needed
-    if hasattr(settings, "set_enable_webaudio"):
-        settings.set_enable_webaudio(False)
-    if hasattr(settings, "set_enable_dns_prefetching"):
-        settings.set_enable_dns_prefetching(False)
-    if hasattr(settings, "set_enable_back_forward_navigation_gestures"):
-        settings.set_enable_back_forward_navigation_gestures(False)
+        settings.set_enable_mediasource(False)
 
-    # 3. Inject Cosmetic CSS & Pre-Load Privacy JS
+    # 4. Inject Cosmetic CSS & Pre-Load Privacy JS
     try:
         style_sheet = WebKit.UserStyleSheet.new(
             COSMETIC_SHIELD_CSS,
@@ -142,7 +148,7 @@ def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_sha
     except Exception:
         pass
 
-    # 4. Compile & Attach Native C++ Bytecode Network Blocker
+    # 5. Compile & Attach Native C++ Bytecode Network Blocker
     try:
         filter_dir = base_share / "filters"
         filter_dir.mkdir(parents=True, exist_ok=True)

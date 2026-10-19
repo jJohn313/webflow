@@ -12,6 +12,7 @@ import traceback
 import argparse
 import urllib.parse
 import subprocess
+import base64
 from pathlib import Path
 
 # Fix WebKitGTK DMA-BUF / EGL crash on Wayland (Hyprland + Nvidia/Mesa)
@@ -274,7 +275,7 @@ class WebflowViewer(Gtk.Window):
             str(self.storage_dir / "cookies.sqlite"),
             WebKit.CookiePersistentStorage.SQLITE
         )
-        cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NO_THIRD_PARTY)
+        cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
 
     def create_tab(self, url: str = None, switch_to: bool = True) -> WebKit.WebView:
         ucm = WebKit.UserContentManager()
@@ -314,6 +315,7 @@ class WebflowViewer(Gtk.Window):
         web_view.connect("load-changed", self.on_load_changed)
         web_view.connect("decide-policy", self.on_decide_policy)
         web_view.connect("create", self.on_create_web_view)
+        web_view.connect("run-file-chooser", self.on_run_file_chooser)
 
         # Tab Header Box
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -437,6 +439,37 @@ class WebflowViewer(Gtk.Window):
         req = navigation_action.get_request()
         url = req.get_uri() if req else None
         return self.create_tab(url, switch_to=True)
+
+    def on_run_file_chooser(self, web_view, request):
+        dialog = Gtk.FileChooserNative.new(
+            "Select File to Upload",
+            self,
+            Gtk.FileChooserAction.OPEN,
+            "_Open",
+            "_Cancel"
+        )
+        dialog.set_select_multiple(request.get_select_multiple())
+
+        filter_obj = request.get_mime_types_filter()
+        if filter_obj:
+            dialog.add_filter(filter_obj)
+        else:
+            all_filter = Gtk.FileFilter()
+            all_filter.set_name("All Files")
+            all_filter.add_pattern("*")
+            dialog.add_filter(all_filter)
+
+        res = dialog.run()
+        if res == Gtk.ResponseType.ACCEPT:
+            filenames = dialog.get_filenames()
+            if filenames:
+                request.select_files(filenames)
+            else:
+                request.cancel()
+        else:
+            request.cancel()
+        dialog.destroy()
+        return True
 
     def is_video_stream_url(self, url: str) -> bool:
         if not url:
@@ -645,6 +678,11 @@ class WebflowViewer(Gtk.Window):
             if target < self.notebook.get_n_pages():
                 self.notebook.set_current_page(target)
             return True
+
+        # Wayland image paste (Ctrl+v): bridges Wayland screenshot/image offers into DOM File/Blob
+        if (event.state & Gdk.ModifierType.CONTROL_MASK) and keyname in ("v", "V"):
+            if self.paste_clipboard_image():
+                return True
 
         if self.mode == "SEARCH":
             if keyname in ("Return", "KP_Enter"):
@@ -857,6 +895,105 @@ class WebflowViewer(Gtk.Window):
             clipboard.set_text(uri, -1)
         self.set_status_notification("📋 Copied URL to clipboard")
 
+    def get_wayland_clipboard_image(self) -> tuple[str, str] | None:
+        try:
+            types_proc = subprocess.run(
+                ["wl-paste", "-l"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.5
+            )
+            if types_proc.returncode == 0:
+                types = types_proc.stdout.splitlines()
+                for mime in ("image/png", "image/jpeg", "image/webp"):
+                    if mime in types:
+                        img_proc = subprocess.run(
+                            ["wl-paste", "--type", mime],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            timeout=1.5
+                        )
+                        if img_proc.returncode == 0 and img_proc.stdout:
+                            b64 = base64.b64encode(img_proc.stdout).decode("ascii")
+                            return (mime, b64)
+        except Exception:
+            pass
+        return None
+
+    def paste_clipboard_image(self) -> bool:
+        img_info = self.get_wayland_clipboard_image()
+        if not img_info:
+            return False
+        mime, b64 = img_info
+        ext = "png" if "png" in mime else ("jpg" if "jpeg" in mime else "webp")
+        filename = f"screenshot_{int(time.time())}.{ext}"
+
+        js_paste = f"""
+        (function() {{
+            try {{
+                const b64 = "{b64}";
+                const mime = "{mime}";
+                const filename = "{filename}";
+                const binStr = atob(b64);
+                const len = binStr.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {{
+                    bytes[i] = binStr.charCodeAt(i);
+                }}
+                const file = new File([bytes], filename, {{ type: mime, lastModified: Date.now() }});
+
+                let target = document.activeElement;
+                if (!target || target === document.body || target.tagName === 'BODY') {{
+                    target = document.querySelector('rich-textarea [contenteditable="true"]') ||
+                             document.querySelector('[contenteditable="true"]') ||
+                             document.querySelector('textarea:not([hidden])') ||
+                             document.querySelector('input[type="file"]') ||
+                             document.querySelector('form') ||
+                             document.body;
+                }}
+
+                const dt = new DataTransfer();
+                dt.items.add(file);
+
+                // 1. Dispatch synthetic ClipboardEvent
+                const pasteEvt = new ClipboardEvent('paste', {{
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    clipboardData: dt
+                }});
+                target.dispatchEvent(pasteEvt);
+
+                // 2. Dispatch DragEvent 'drop' for dropzone uploaders (Gemini prompt container)
+                const dropEvt = new DragEvent('drop', {{
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    dataTransfer: dt
+                }});
+                const dropTarget = target.closest('form') || target.closest('rich-textarea') || target;
+                dropTarget.dispatchEvent(dropEvt);
+
+                // 3. Assign directly to file input if present in active container
+                const fileInputs = document.querySelectorAll('input[type="file"]');
+                for (const fi of fileInputs) {{
+                    try {{
+                        fi.files = dt.files;
+                        fi.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }} catch (e) {{}}
+                }}
+                return true;
+            }} catch (err) {{
+                console.error("Webflow paste image error:", err);
+                return false;
+            }}
+        }})();
+        """
+        self.eval_js(js_paste)
+        self.set_status_notification("📷 Pasted screenshot from clipboard")
+        return True
+
     def sync_workbench_on_exit(self):
         if not self.wb_manifest or not self.wb_manifest.exists():
             return
@@ -877,24 +1014,10 @@ class WebflowViewer(Gtk.Window):
         except Exception:
             pass
 
-    def purge_non_essential_data(self):
-        try:
-            if hasattr(self, "data_manager") and self.data_manager:
-                purge_types = (
-                    WebKit.WebsiteDataTypes.DISK_CACHE |
-                    WebKit.WebsiteDataTypes.MEMORY_CACHE |
-                    WebKit.WebsiteDataTypes.OFFLINE_APPLICATION_CACHE |
-                    WebKit.WebsiteDataTypes.SERVICE_WORKER_REGISTRATIONS
-                )
-                self.data_manager.clear(purge_types, 0, None, None, None)
-        except Exception:
-            pass
-
     def on_quit(self, *args):
-        self.purge_non_essential_data()
         self.sync_workbench_on_exit()
+        self.destroy()
         Gtk.main_quit()
-        sys.exit(0)
 
 
 def GObject_new_webview(web_context, ucm):

@@ -152,8 +152,11 @@ webflow
 | `E` / `e` | De-escalate back to Terminal Reader (`wf-reader`) |
 | `q` | Quit browser (closes all tabs and syncs workbench manifest) |
 
-### Insert Mode & Omnibar
+### Insert Mode, Omnibar & Media Uploads
 - Triggered automatically when clicking or focusing an `<input>`, `<textarea>`, or content-editable container, or by typing `i`, `o`, or `O`/`t`.
+- **Screenshot Pasting (`Ctrl+v`)**: Automatically bridges Wayland clipboard image data (`image/png`, `image/jpeg`, `image/webp`) into W3C `ClipboardEvent` and `DragEvent` `File` payloads with Shadow DOM penetration (`composed: true`). Instantly paste screenshots directly into webchats (Gemini, ChatGPT, Discord, GitHub).
+- **Native File Chooser (`Gtk.FileChooserNative`)**: Clicking upload buttons (`+` or `<input type="file">`) invokes the native desktop portal dialog to select and attach local files, photos, PDFs, or code.
+- **Persistent SSO Sessions**: Unified cookie jar (`cookies.sqlite`) with `CookieAcceptPolicy.ALWAYS` and ITP partitioning disabled ensures Google Account, GitHub, and institutional logins persist seamlessly between Ephemeral mode and Workbenches.
 - Press **`Escape`** to dismiss the omnibar, blur active inputs, restore keyboard sovereignty, and return to **`NORMAL`** mode.
 
 ---
