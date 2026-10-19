@@ -84,6 +84,71 @@ FOCUS_OBSERVER_JS = """
             window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({action: 'set_mode', mode: 'NORMAL'}));
         }
     }, true);
+
+    // Track recently clicked text / labels (for Gemini 'Upload folder' / 'Import folder')
+    var lastClickedText = '';
+    var lastClickedTime = 0;
+
+    window.addEventListener('click', function(e) {
+        var el = e.target;
+        if (!el) return;
+        var text = (el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.title || '');
+        var parent = el.parentElement;
+        if (parent) {
+            text += ' ' + (parent.innerText || '') + ' ' + (parent.getAttribute('aria-label') || '');
+        }
+        if (/folder|directory/i.test(text)) {
+            lastClickedText = text;
+            lastClickedTime = Date.now();
+        }
+        if ((el.tagName || '').toLowerCase() === 'input' && (el.type || '').toLowerCase() === 'file') {
+            notifyFileInput(el);
+        } else {
+            var label = el.closest('label');
+            if (label) {
+                var input = label.querySelector('input[type="file"]');
+                if (!input && label.htmlFor) {
+                    input = document.getElementById(label.htmlFor);
+                }
+                if (input) notifyFileInput(input);
+            }
+        }
+    }, true);
+
+    function notifyFileInput(el) {
+        if (!el) return;
+        var isDir = el.hasAttribute('webkitdirectory') ||
+                    el.hasAttribute('directory') ||
+                    el.hasAttribute('mozdirectory') ||
+                    el.hasAttribute('nwdirectory') ||
+                    el.hasAttribute('allowdirs') ||
+                    el.webkitdirectory === true;
+        if (!isDir && (Date.now() - lastClickedTime < 3000)) {
+            isDir = true;
+        }
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.webflow) {
+            window.webkit.messageHandlers.webflow.postMessage(JSON.stringify({
+                action: 'file_chooser_hint',
+                isDirectory: !!isDir
+            }));
+        }
+    }
+
+    var origClick = HTMLInputElement.prototype.click;
+    HTMLInputElement.prototype.click = function() {
+        if ((this.type || '').toLowerCase() === 'file') {
+            notifyFileInput(this);
+        }
+        return origClick.apply(this, arguments);
+    };
+
+    var origDispatch = HTMLElement.prototype.dispatchEvent;
+    HTMLElement.prototype.dispatchEvent = function(evt) {
+        if ((this.tagName || '').toLowerCase() === 'input' && (this.type || '').toLowerCase() === 'file' && evt && evt.type === 'click') {
+            notifyFileInput(this);
+        }
+        return origDispatch.apply(this, arguments);
+    };
 })();
 """
 
@@ -107,6 +172,8 @@ class WebflowViewer(Gtk.Window):
         self.vault = WebflowVault()
         self.autofill_script_path = REPO_ROOT / "assets" / "autofill.js"
         self.pending_credentials = None
+        self.file_chooser_is_dir = False
+        self.file_chooser_hint_time = 0.0
 
         self.base_share = Path.home() / ".local" / "share" / "webflow"
         # Common storage path for engine cache/data/cookies
@@ -434,6 +501,14 @@ class WebflowViewer(Gtk.Window):
     def on_omnibar_activate(self, entry):
         text = entry.get_text().strip()
         if text:
+            if text.startswith(":"):
+                cmd = text[1:].strip().lower()
+                if cmd in ("folder", "upload-folder", "uf"):
+                    self.file_chooser_is_dir = True
+                    self.file_chooser_hint_time = time.time()
+                    self.set_status_notification("📂 Next file upload will prompt for a Folder")
+                    self.close_omnibar()
+                    return
             if "://" in text:
                 url = text
             elif "." in text and " " not in text:
@@ -459,29 +534,66 @@ class WebflowViewer(Gtk.Window):
         return self.create_tab(url, switch_to=True)
 
     def on_run_file_chooser(self, web_view, request):
-        dialog = Gtk.FileChooserNative.new(
-            "Select File to Upload",
-            self,
-            Gtk.FileChooserAction.OPEN,
-            "_Open",
-            "_Cancel"
+        now = time.time()
+        is_dir = (
+            getattr(self, "file_chooser_is_dir", False) and
+            (now - getattr(self, "file_chooser_hint_time", 0.0) < 60.0)
         )
-        dialog.set_select_multiple(request.get_select_multiple())
+        self.file_chooser_is_dir = False
 
-        filter_obj = request.get_mime_types_filter()
-        if filter_obj:
-            dialog.add_filter(filter_obj)
+        if is_dir:
+            dialog = Gtk.FileChooserNative.new(
+                "Select Folder to Upload",
+                self,
+                Gtk.FileChooserAction.SELECT_FOLDER,
+                "_Upload",
+                "_Cancel"
+            )
+            dialog.set_select_multiple(request.get_select_multiple())
         else:
-            all_filter = Gtk.FileFilter()
-            all_filter.set_name("All Files")
-            all_filter.add_pattern("*")
-            dialog.add_filter(all_filter)
+            dialog = Gtk.FileChooserNative.new(
+                "Select File(s) to Upload",
+                self,
+                Gtk.FileChooserAction.OPEN,
+                "_Open",
+                "_Cancel"
+            )
+            dialog.set_select_multiple(request.get_select_multiple())
+
+            filter_obj = request.get_mime_types_filter()
+            if filter_obj:
+                dialog.add_filter(filter_obj)
+            else:
+                all_filter = Gtk.FileFilter()
+                all_filter.set_name("All Files")
+                all_filter.add_pattern("*")
+                dialog.add_filter(all_filter)
 
         res = dialog.run()
         if res == Gtk.ResponseType.ACCEPT:
             filenames = dialog.get_filenames()
             if filenames:
+                # If a folder was chosen for a standard multi-file input (not webkitdirectory),
+                # recursively expand all files inside it so the file input receives all files.
+                # If webkitdirectory is true (is_dir is True), pass the root directory path directly
+                # so WebKit populates files with webkitRelativePath preserved.
+                if not is_dir and any(os.path.isdir(p) for p in filenames):
+                    expanded = []
+                    for p in filenames:
+                        if os.path.isdir(p):
+                            for root, _, files in os.walk(p):
+                                for f in files:
+                                    expanded.append(os.path.join(root, f))
+                        else:
+                            expanded.append(p)
+                    filenames = expanded
+
                 request.select_files(filenames)
+                if is_dir:
+                    folder_name = Path(filenames[0]).name if filenames else "folder"
+                    self.set_status_notification(f"📁 Uploading folder: {folder_name}")
+                else:
+                    self.set_status_notification(f"📁 Selected {len(filenames)} item(s) for upload")
             else:
                 request.cancel()
         else:
@@ -652,6 +764,10 @@ class WebflowViewer(Gtk.Window):
                     existing = self.vault.get_credentials(dom)
                     if not existing or existing[1] != pwd or (u and existing[0] != u):
                         self.prompt_save_credentials(dom, u, pwd)
+            elif action == "file_chooser_hint":
+                is_dir = bool(data.get("isDirectory", False))
+                self.file_chooser_is_dir = is_dir
+                self.file_chooser_hint_time = time.time()
         except Exception:
             pass
 
@@ -869,6 +985,11 @@ class WebflowViewer(Gtk.Window):
             return True
         elif keyname == "P":
             self.eval_js("if (window.__wf_capture_credentials) window.__wf_capture_credentials();")
+            return True
+        elif keyname == "U":
+            self.file_chooser_is_dir = True
+            self.file_chooser_hint_time = time.time()
+            self.set_status_notification("📂 Next file upload will prompt for a Folder")
             return True
         elif keyname in ("M", "m"):
             uri = view.get_uri() or self.initial_urls[0]
