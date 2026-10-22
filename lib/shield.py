@@ -27,16 +27,24 @@ WEBKIT_BLOCK_RULES = [
     },
     {
         "trigger": {
-            "url-filter": "(doubleclick\\.net|googlesyndication\\.com|adservice\\.google\\.|pagead2\\.googlesyndication|adsystem\\.com|adnxs\\.com|rubiconproject\\.com|pubmatic\\.com|criteo\\.com|outbrain\\.com|taboola\\.com|scorecardresearch\\.com|quantserve\\.com|hotjar\\.com|mouseflow\\.com|fullstory\\.com|clarity\\.ms|mixpanel\\.com|segment\\.io|amplitude\\.com|sentry\\.io|bugsnag\\.com|newrelic\\.com|nr-data\\.net|connect\\.facebook\\.net|analytics\\.tiktok\\.com|ads-twitter\\.com)"
+            "url-filter": ".*",
+            "if-domain": [
+                "*doubleclick.net", "*googlesyndication.com", "*adservice.google.*",
+                "*pagead2.googlesyndication.com", "*adsystem.com", "*adnxs.com",
+                "*rubiconproject.com", "*pubmatic.com", "*criteo.com", "*outbrain.com",
+                "*taboola.com", "*scorecardresearch.com", "*quantserve.com", "*hotjar.com",
+                "*mouseflow.com", "*fullstory.com", "*clarity.ms", "*mixpanel.com",
+                "*segment.io", "*amplitude.com", "*sentry.io", "*bugsnag.com",
+                "*newrelic.com", "*nr-data.net", "*connect.facebook.net",
+                "*analytics.tiktok.com", "*ads-twitter.com"
+            ]
         },
         "action": {"type": "block"}
     },
-    {
-        "trigger": {
-            "url-filter": "(/api/stats/ads|/api/stats/atr|/pagead/|/ptracking|/get_midroll_info|/collect\\?v=|/pixel\\.|/fbevents\\.js)"
-        },
-        "action": {"type": "block"}
-    },
+    {"trigger": {"url-filter": "/pagead/"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "/fbevents\\.js"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "/api/stats/ads"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "/ptracking"}, "action": {"type": "block"}},
     {
         "trigger": {
             "url-filter": ".*",
@@ -105,16 +113,10 @@ def apply_shield_and_ram_diet(web_context, data_manager, ucm, settings, base_sha
     # In-memory page cache keeps dead pages frozen in RAM; disabling it relies on the fast 200MB NVMe disk cache
     if hasattr(settings, "set_enable_page_cache"):
         settings.set_enable_page_cache(False)
-    if hasattr(settings, "set_enable_offline_web_application_cache"):
-        settings.set_enable_offline_web_application_cache(True)
-    if hasattr(settings, "set_enable_hyperlink_auditing"):
-        settings.set_enable_hyperlink_auditing(False)
     if hasattr(settings, "set_enable_webgl"):
         settings.set_enable_webgl(True)
     if hasattr(settings, "set_enable_webaudio"):
         settings.set_enable_webaudio(True)
-    if hasattr(settings, "set_enable_dns_prefetching"):
-        settings.set_enable_dns_prefetching(True)
     if hasattr(settings, "set_javascript_can_access_clipboard"):
         settings.set_javascript_can_access_clipboard(True)
     if hasattr(settings, "set_enable_back_forward_navigation_gestures"):

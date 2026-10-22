@@ -20,6 +20,17 @@ import subprocess
 from pathlib import Path
 from html.parser import HTMLParser
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
+}
+
 VOID_TAGS = {
     "area", "base", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr"
@@ -39,7 +50,7 @@ class SemanticHTMLToMarkdown(HTMLParser):
             "noscript", "iframe", "svg", "button", "form"
         }
         if not keep_nav_links:
-            self.ignored_tags.update({"nav", "header", "figure", "figcaption"})
+            self.ignored_tags.update({"nav"})
         self.ignore_stack = []
         self.current_href = None
         self.current_link_text = []
@@ -71,7 +82,9 @@ class SemanticHTMLToMarkdown(HTMLParser):
             "mw-jump-link", "printfooter", "noprint", "ambox", "hatnote",
             "navbox", "sisterproject"
         ]
-        if any(tok in class_id for tok in noise_tokens):
+        if tag_lower in ("html", "body", "main", "article", "figure", "picture", "img"):
+            pass
+        elif any(tok in class_id for tok in noise_tokens):
             if not is_void:
                 self.ignore_stack.append(tag_lower)
             return
@@ -102,11 +115,24 @@ class SemanticHTMLToMarkdown(HTMLParser):
         elif tag_lower == "pre":
             self.in_pre = True
             self.output.append("\n\n```\n")
+        elif tag_lower == "figcaption":
+            self.output.append("\n*Caption: ")
         elif tag_lower == "img":
-            src = attrs_dict.get("src", "") or attrs_dict.get("data-src", "") or attrs_dict.get("data-original", "")
-            alt = (attrs_dict.get("alt", "") or attrs_dict.get("title", "")).strip()
+            src = (
+                attrs_dict.get("src", "") or
+                attrs_dict.get("data-src", "") or
+                attrs_dict.get("data-original", "") or
+                attrs_dict.get("data-lazy-src", "")
+            ).strip()
+            alt = (
+                attrs_dict.get("alt", "") or
+                attrs_dict.get("title", "") or
+                attrs_dict.get("data-image-name", "")
+            ).strip()
             noise_img = ["/icons/", "wordmark", "tagline", "protection-sh", "edit-pencil", "data:image/svg", "data:image/gif"]
             if src and not any(tok in src.lower() for tok in noise_img):
+                if src.startswith("//"):
+                    src = "https:" + src
                 full_src = urllib.parse.urljoin(self.base_url, src)
                 clean_alt = re.sub(r"[\[\]()]", "", alt).strip() or "Illustration"
                 self.output.append(f"\n\n![{clean_alt}]({full_src})\n\n")
@@ -134,6 +160,8 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.output.append("* ")
         elif tag_lower == "code" and not self.in_pre:
             self.output.append("` ")
+        elif tag_lower == "figcaption":
+            self.output.append("*\n\n")
         elif tag_lower == "a" and self.current_href:
             link_text = "".join(self.current_link_text).strip()
             if link_text:
@@ -216,9 +244,7 @@ def render_inline_image(img_url: str, max_w: int, max_h: int) -> list:
 
     if not cached_path.exists() or cached_path.stat().st_size == 0:
         try:
-            req = urllib.request.Request(img_url, headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
-            })
+            req = urllib.request.Request(img_url, headers=BROWSER_HEADERS)
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 cached_path.write_bytes(resp.read())
         except Exception:
@@ -384,9 +410,8 @@ def resolve_url_or_search(query: str) -> str:
     if "." in query and " " not in query:
         return f"https://{query}"
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
         data = urllib.parse.urlencode({"q": query}).encode("utf-8")
-        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data, headers=headers)
+        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data, headers=BROWSER_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as resp:
             html_text = resp.read().decode("utf-8", errors="replace")
         links = re.findall(r'<a[^>]+href=[\'\"](https?://[^\'\"]+)[\'\"][^>]*class=[\'\"]result-link[\'\"]', html_text)
@@ -402,10 +427,7 @@ def extract_content(url: str):
     if parsed.netloc in ("www.wikipedia.org", "wikipedia.org") and parsed.path in ("", "/"):
         url = "https://en.wikipedia.org/wiki/Main_Page"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw_html = resp.read().decode("utf-8", errors="replace")
 
@@ -428,6 +450,7 @@ def extract_content(url: str):
     body_html = raw_html
     for pattern in [
         r'<div[^>]+id=["\']mw-content-text["\'][^>]*>(.*?)<div class=["\']printfooter["\']',
+        r'<div[^>]+class=["\'][^"\']*mw-parser-output[^"\']*["\'][^>]*>(.*)',
         r'<main[^>]*>(.*?)</main>',
         r'<article[^>]*>(.*?)</article>'
     ]:
@@ -494,9 +517,7 @@ def display_image_high_res(stdscr, img_url: str, title: str = ""):
         sys.stdout.flush()
 
         try:
-            req = urllib.request.Request(img_url, headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
-            })
+            req = urllib.request.Request(img_url, headers=BROWSER_HEADERS)
             url_hash = hashlib.sha256(img_url.encode("utf-8")).hexdigest()[:16]
             ext = Path(urllib.parse.urlparse(img_url).path).suffix or ".png"
             if len(ext) > 5 or not ext:
