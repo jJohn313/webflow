@@ -106,13 +106,12 @@ class SemanticHTMLToMarkdown(HTMLParser):
                 self.current_href = urllib.parse.urljoin(self.base_url, href)
                 self.current_link_text = []
 
-        if not is_void:
-            self.ignore_stack.append(tag_lower)
-
     def handle_endtag(self, tag):
         tag_lower = tag.lower()
-        if self.ignore_stack and self.ignore_stack[-1] == tag_lower:
-            self.ignore_stack.pop()
+        if self.ignore_stack:
+            if self.ignore_stack[-1] == tag_lower:
+                self.ignore_stack.pop()
+            return
 
         if tag_lower == "title":
             self.in_title = False
@@ -133,14 +132,15 @@ class SemanticHTMLToMarkdown(HTMLParser):
             self.current_link_text = []
 
     def handle_data(self, data):
-        if self.ignore_stack and self.ignore_stack[-1] in self.ignored_tags:
+        if self.ignore_stack:
             return
         if self.in_title:
             self.title += data
             return
         if self.current_href is not None:
             self.current_link_text.append(data)
-        self.output.append(data)
+        else:
+            self.output.append(data)
 
     def get_markdown(self):
         raw = "".join(self.output)
@@ -427,6 +427,7 @@ def run_interactive_reader(initial_buffers: list):
 
         link_buf = ""
         link_open_split = False
+        link_prompt = False
         split_prompt = False
         split_buf = ""
         status_note = ""
@@ -551,9 +552,9 @@ def run_interactive_reader(initial_buffers: list):
             if split_prompt:
                 bar1 = f" ➜ Open in split (URL / search): {split_buf}_  (Enter to open, Esc to cancel)"
                 bar1_color = curses.color_pair(3) | curses.A_BOLD
-            elif link_buf:
-                dest = "Other Split (T)" if link_open_split else "Current Pane (Enter)"
-                bar1 = f" 🔗 Follow Link #{link_buf}_ in {dest}  (Esc to cancel)"
+            elif link_prompt or link_buf:
+                dest = "Split Pane (F)" if link_open_split else "Current Pane (Enter)"
+                bar1 = f" 🔗 Follow Link #{link_buf}_ in {dest}  (Type # and Enter, Esc to cancel)"
                 bar1_color = curses.color_pair(3) | curses.A_BOLD
             elif status_note:
                 bar1 = f" {status_note}"
@@ -566,9 +567,9 @@ def run_interactive_reader(initial_buffers: list):
                 bar1_color = curses.color_pair(5) | curses.A_BOLD
 
             if len(buffers) >= 2:
-                bar2 = " j/k: Scroll Pane | Tab: Switch Pane | t: New Split | x: Close Split | 1-9: Link | E: GUI | q: Close/Quit"
+                bar2 = " j/k: Scroll | Tab: Switch Pane | f/F: Link | t: Split | x: Close Split | E: GUI | q: Quit"
             else:
-                bar2 = " j/k: Scroll | t: Split View | 0-9: Link | E: GUI | b: Bookmark | s: Save | q: Quit"
+                bar2 = " j/k: Scroll | f/F: Follow Link | t: Split View | E: GUI | b: Bookmark | s: Save | q: Quit"
 
             try:
                 stdscr.addstr(h - 2, 0, bar1[:w - 1].ljust(w - 1), bar1_color)
@@ -626,8 +627,9 @@ def run_interactive_reader(initial_buffers: list):
                 continue
 
             # Handle Link buffer prompt
-            if link_buf:
+            if link_prompt or link_buf:
                 if key in (10, 13):  # Enter
+                    link_prompt = False
                     try:
                         num = int(link_buf)
                     except ValueError:
@@ -668,9 +670,10 @@ def run_interactive_reader(initial_buffers: list):
                     else:
                         status_note = f"[-] Link [{num}] not found"
                 elif key == 27:  # Esc
+                    link_prompt = False
                     link_buf = ""
-                elif key in (ord('T'), ord('t')):
-                    link_open_split = True
+                elif key in (ord('T'), ord('t'), ord('F')):
+                    link_open_split = not link_open_split
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
                     link_buf = link_buf[:-1]
                 elif ord('0') <= key <= ord('9'):
@@ -749,10 +752,16 @@ def run_interactive_reader(initial_buffers: list):
             elif key in (ord('t'), ord('\x01'), ord('\x14')):  # t, Ctrl-a, or Ctrl-t -> open split
                 split_prompt = True
                 split_buf = ""
+            elif key in (ord('f'), ord('F')):  # Follow link (f: current pane, F: split pane)
+                link_prompt = True
+                link_open_split = (key == ord('F'))
+                link_buf = ""
             elif key == ord('T'):  # Follow link in new split
+                link_prompt = True
                 link_open_split = True
                 link_buf = ""
             elif ord('1') <= key <= ord('9'):
+                link_prompt = True
                 link_open_split = False
                 link_buf = chr(key)
             elif key in (ord('e'), ord('E')):
