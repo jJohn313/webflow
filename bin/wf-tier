@@ -63,14 +63,22 @@ def matches_rule(url: str, rules: list):
     return None
 
 
-def probe_url(url: str, timeout: float = 2.5):
+def probe_url(url: str, timeout: float = 3.0):
     """
-    Fast streaming probe (max 32 KB) checking Content-Type,
-    SPA mounting markers, and semantic text density.
+    Streaming probe (up to 256 KB) checking Content-Type, OpenGraph/Schema
+    article metadata, SPA mounting containers, and semantic text density.
     Returns (tier, reason)
     """
+    p = urllib.parse.urlparse(url)
+    h = p.netloc.lower()
+    path = p.path.lower()
+
+    # Fast path & subdomain hints
+    is_path_article = bool(re.search(r"/(wikis?|guides?|walkthroughs?|articles?|reviews?|news|blogs?|posts?|stories|docs?|titles?|tutorials?|how-tos?)/", path))
+    is_subdomain_doc = bool(re.search(r"^(wiki|docs?|man|blog|news|developer)\.", h))
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Webflow/0.2.0",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
 
@@ -81,28 +89,45 @@ def probe_url(url: str, timeout: float = 2.5):
             if "text/html" not in content_type and "application/xhtml" not in content_type:
                 return "TIER3", f"Non-HTML Content-Type: {content_type}"
 
-            chunk = resp.read(32768).decode("utf-8", errors="replace")
+            chunk = resp.read(262144).decode("utf-8", errors="replace")
 
-            # SPA markers
+            # 1. Semantic OpenGraph article metadata (works on IGN, Medium, Substack, news, blogs)
+            if re.search(r'<meta[^>]+property=["\']og:type["\'][^>]+content=["\']article["\']', chunk, re.I) or \
+               re.search(r'<meta[^>]+content=["\']article["\'][^>]+property=["\']og:type["\']', chunk, re.I) or \
+               re.search(r'<meta[^>]+property=["\']article:(author|published_time|section|tag)["\']', chunk, re.I):
+                return "TIER1", "Semantic article metadata detected (og:type=article)"
+
+            # 2. Schema.org JSON-LD article types
+            if re.search(r'["\']@type["\']\s*:\s*["\'](Article|NewsArticle|TechArticle|BlogPosting|Guide|HowTo)["\']', chunk, re.I):
+                return "TIER1", "JSON-LD Article/Guide schema detected"
+
+            # 3. Path/subdomain article with meta description
+            if is_path_article or is_subdomain_doc:
+                meta_desc = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{60,})["\']', chunk, re.I)
+                if meta_desc:
+                    return "TIER1", f"Article path/subdomain with description ({len(meta_desc.group(1))} chars)"
+
+            # 4. SPA container check (only if not an article)
             spa_markers = [
-                (r'<div[^>]+id=["\']root["\']', "SPA root div (#root)"),
-                (r'<div[^>]+id=["\']app["\']', "SPA app div (#app)"),
-                (r'<div[^>]+id=["\']__next["\']>\s*</div>', "Next.js client mount container"),
-                (r'<div[^>]+id=["\']__nuxt["\']>\s*</div>', "Nuxt client mount container"),
+                (r'<div[^>]+id=["\']root["\']>\s*</div>', "Empty SPA root container (#root)"),
+                (r'<div[^>]+id=["\']app["\']>\s*</div>', "Empty SPA app container (#app)"),
+                (r'<div[^>]+id=["\']__next["\']>\s*</div>', "Empty Next.js client mount container"),
+                (r'<div[^>]+id=["\']__nuxt["\']>\s*</div>', "Empty Nuxt client mount container"),
                 (r'<noscript>[^<]*enable JavaScript', "Mandatory JavaScript requirement notice"),
-                (r'<app-root', "Angular client app-root")
+                (r'<app-root>\s*</app-root>', "Angular client app-root")
             ]
             for pattern, label in spa_markers:
                 if re.search(pattern, chunk, re.IGNORECASE):
                     return "TIER3", f"SPA marker detected: {label}"
 
-            # Semantic text length
+            # 5. Semantic text length in body elements
             p_text = "".join(re.findall(r'<p[^>]*>(.*?)</p>', chunk, re.DOTALL | re.IGNORECASE))
             article_text = "".join(re.findall(r'<article[^>]*>(.*?)</article>', chunk, re.DOTALL | re.IGNORECASE))
-            combined_text = re.sub(r'<[^>]+>', '', p_text + article_text).strip()
+            main_text = "".join(re.findall(r'<main[^>]*>(.*?)</main>', chunk, re.DOTALL | re.IGNORECASE))
+            combined_text = re.sub(r'<[^>]+>', '', p_text + article_text + main_text).strip()
 
-            if len(combined_text) >= 500:
-                return "TIER1", f"Substantial semantic prose ({len(combined_text)} characters in initial 32KB)"
+            if len(combined_text) >= 350:
+                return "TIER1", f"Substantial semantic prose ({len(combined_text)} characters in initial stream)"
             else:
                 return "TIER3", f"Sparse initial text ({len(combined_text)} chars); likely app UI or dynamic dashboard"
 
