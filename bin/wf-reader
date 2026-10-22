@@ -175,7 +175,7 @@ def format_links_for_reading(md_text: str, base_url: str):
         counter += 1
         label = alt if alt and len(alt) <= 60 else "Illustration / Diagram"
         links.append((counter, f"[Image] {label}", full_url, True))
-        return f"\n\n  🖼️  **[Image: {label}]** `[{counter}]`\n\n"
+        return f"\n\n<!--WF_IMG:{counter}:{label}:{full_url}-->\n\n"
 
     cleaned_md = re.sub(r"!\[([^\[\]]*)\]\(([^)\s]+)\)", repl_img, md_text)
 
@@ -193,9 +193,51 @@ def format_links_for_reading(md_text: str, base_url: str):
         links.append((counter, text, full_url, False))
         return f"**{text}** `[{counter}]`"
 
-    cleaned_md = re.sub(r" `\[\d+\]`", "", cleaned_md)
     processed = re.sub(r"(?<!!)\[([^\[\]]+)\]\(([^)\s]+)\)", repl_link, cleaned_md)
     return processed, links
+
+
+def render_inline_image(img_url: str, max_w: int, max_h: int) -> list:
+    """
+    Renders a responsive in-terminal ASCII/Unicode half-block graphic preview
+    using chafa --probe=off. Downloaded graphics are cached in ~/.cache/webflow/images.
+    """
+    chafa_bin = shutil.which("chafa")
+    if not chafa_bin:
+        return []
+
+    cache_dir = Path.home() / ".cache" / "webflow" / "images"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    url_hash = hashlib.sha256(img_url.encode("utf-8")).hexdigest()[:16]
+    ext = Path(urllib.parse.urlparse(img_url).path).suffix or ".png"
+    if len(ext) > 5 or not ext:
+        ext = ".png"
+    cached_path = cache_dir / f"{url_hash}{ext}"
+
+    if not cached_path.exists() or cached_path.stat().st_size == 0:
+        try:
+            req = urllib.request.Request(img_url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
+            })
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                cached_path.write_bytes(resp.read())
+        except Exception:
+            return []
+
+    try:
+        res = subprocess.run(
+            [chafa_bin, "--probe=off", "-c", "16", "-f", "symbols", f"--size={max_w}x{max_h}", str(cached_path)],
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            raw_lines = res.stdout.splitlines()
+            cleaned = [re.sub(r"\x1b\[\?[0-9]+[a-zA-Z]", "", l) for l in raw_lines]
+            return cleaned
+    except Exception:
+        pass
+    return []
 
 
 def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list, width: int = 80) -> str:
@@ -280,6 +322,28 @@ def render_markdown_to_ansi(title: str, url: str, md_text: str, links: list, wid
             q_clean = re.sub(r"^>\s*", "", block, flags=re.MULTILINE)
             for wline in textwrap.wrap(q_clean, width=max(10, width - 4)):
                 out.append(f"{pad}{YELLOW}│{RESET} {ITALIC}{style_inline(wline)}{RESET}")
+            out.append("")
+            continue
+
+        m_img = re.search(r"<!--WF_IMG:(\d+):([^:]*):(.*?)-->", block)
+        if m_img:
+            img_num = m_img.group(1)
+            img_label = m_img.group(2) or "Illustration"
+            img_url = m_img.group(3)
+
+            out.append(f"{pad}  🖼️  {BOLD}{CYAN}[Image: {img_label}]{RESET} {YELLOW}[{img_num}]{RESET}  {DIM}(i{img_num} / f{img_num}: High-Res Viewer){RESET}")
+
+            img_w = max(16, min(width - 8, 48))
+            img_h = max(5, min(14, int(img_w * 0.44)))
+            inline_lines = render_inline_image(img_url, img_w, img_h)
+
+            if inline_lines:
+                box_top = f"{pad}  {DIM}┌── preview {'─' * max(2, img_w - 9)}┐{RESET}"
+                out.append(box_top)
+                for il in inline_lines:
+                    out.append(f"{pad}  {DIM}│{RESET} {il}")
+                box_bot = f"{pad}  {DIM}└{'─' * max(2, img_w + 3)}┘{RESET}"
+                out.append(box_bot)
             out.append("")
             continue
 
@@ -479,34 +543,97 @@ def display_image_high_res(stdscr, img_url: str, title: str = ""):
         stdscr.refresh()
 
 
-ANSI_SPLIT_RE = re.compile(r"(\033\[[0-9;]*m)")
+ANSI_COLOR_MAP = {
+    30: curses.COLOR_BLACK, 31: curses.COLOR_RED, 32: curses.COLOR_GREEN,
+    33: curses.COLOR_YELLOW, 34: curses.COLOR_BLUE, 35: curses.COLOR_MAGENTA,
+    36: curses.COLOR_CYAN, 37: curses.COLOR_WHITE
+}
+
+COLOR_PAIR_CACHE = {}
+NEXT_COLOR_PAIR = 10
+
+
+def get_curses_color_pair(fg: int, bg: int) -> int:
+    global NEXT_COLOR_PAIR
+    key = (fg, bg)
+    if key in COLOR_PAIR_CACHE:
+        return curses.color_pair(COLOR_PAIR_CACHE[key])
+    if curses.has_colors() and NEXT_COLOR_PAIR < getattr(curses, "COLOR_PAIRS", 256):
+        try:
+            curses.init_pair(NEXT_COLOR_PAIR, fg, bg)
+            COLOR_PAIR_CACHE[key] = NEXT_COLOR_PAIR
+            pair_num = NEXT_COLOR_PAIR
+            NEXT_COLOR_PAIR += 1
+            return curses.color_pair(pair_num)
+        except Exception:
+            return curses.A_NORMAL
+    return curses.A_NORMAL
+
 
 def parse_ansi_line(line: str):
+    clean_line = re.sub(r"\x1b\[\?[0-9]+[a-zA-Z]", "", line)
+    parts = re.split(r"(\x1b\[[0-9;]*m)", clean_line)
     segments = []
-    attr = curses.A_NORMAL
-    parts = ANSI_SPLIT_RE.split(line)
+    cur_fg = -1
+    cur_bg = -1
+    cur_rev = False
+    cur_bold = False
+    cur_dim = False
+    cur_italic = False
+
     for part in parts:
         if not part:
             continue
-        if part.startswith("\033["):
-            code = part[2:-1]
-            if code == "0":
-                attr = curses.A_NORMAL
-            elif code == "1":
-                attr |= curses.A_BOLD
-            elif code == "2":
-                attr |= curses.A_DIM
-            elif code == "3":
-                attr |= getattr(curses, "A_ITALIC", curses.A_NORMAL)
-            elif code == "36":
-                attr = (attr & ~curses.A_COLOR) | curses.color_pair(1)
-            elif code == "32":
-                attr = (attr & ~curses.A_COLOR) | curses.color_pair(2)
-            elif code == "33":
-                attr = (attr & ~curses.A_COLOR) | curses.color_pair(3)
-            elif code == "35":
-                attr = (attr & ~curses.A_COLOR) | curses.color_pair(4)
+        if part.startswith("\x1b["):
+            raw_codes = part[2:-1].split(";")
+            for c_str in raw_codes:
+                if not c_str:
+                    code = 0
+                else:
+                    try:
+                        code = int(c_str)
+                    except ValueError:
+                        code = 0
+                if code == 0:
+                    cur_fg = -1
+                    cur_bg = -1
+                    cur_rev = False
+                    cur_bold = False
+                    cur_dim = False
+                    cur_italic = False
+                elif code == 1:
+                    cur_bold = True
+                elif code == 2:
+                    cur_dim = True
+                elif code == 3:
+                    cur_italic = True
+                elif code == 7:
+                    cur_rev = True
+                elif code == 27:
+                    cur_rev = False
+                elif 30 <= code <= 37:
+                    cur_fg = ANSI_COLOR_MAP.get(code, -1)
+                elif 90 <= code <= 97:
+                    cur_fg = ANSI_COLOR_MAP.get(code - 60, -1)
+                    cur_bold = True
+                elif code == 39:
+                    cur_fg = -1
+                elif 40 <= code <= 47:
+                    cur_bg = ANSI_COLOR_MAP.get(code - 10, -1)
+                elif 100 <= code <= 107:
+                    cur_bg = ANSI_COLOR_MAP.get(code - 70, -1)
+                elif code == 49:
+                    cur_bg = -1
         else:
+            attr = get_curses_color_pair(cur_fg, cur_bg)
+            if cur_bold:
+                attr |= curses.A_BOLD
+            if cur_dim:
+                attr |= curses.A_DIM
+            if cur_rev:
+                attr |= curses.A_REVERSE
+            if cur_italic:
+                attr |= getattr(curses, "A_ITALIC", curses.A_NORMAL)
             segments.append((part, attr))
     return segments
 
@@ -542,6 +669,17 @@ def run_interactive_reader(initial_buffers: list):
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_MAGENTA, -1)
             curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(6, curses.COLOR_RED, -1)
+            curses.init_pair(7, curses.COLOR_BLUE, -1)
+            curses.init_pair(8, curses.COLOR_WHITE, -1)
+            COLOR_PAIR_CACHE[(curses.COLOR_CYAN, -1)] = 1
+            COLOR_PAIR_CACHE[(curses.COLOR_GREEN, -1)] = 2
+            COLOR_PAIR_CACHE[(curses.COLOR_YELLOW, -1)] = 3
+            COLOR_PAIR_CACHE[(curses.COLOR_MAGENTA, -1)] = 4
+            COLOR_PAIR_CACHE[(curses.COLOR_BLACK, curses.COLOR_CYAN)] = 5
+            COLOR_PAIR_CACHE[(curses.COLOR_RED, -1)] = 6
+            COLOR_PAIR_CACHE[(curses.COLOR_BLUE, -1)] = 7
+            COLOR_PAIR_CACHE[(curses.COLOR_WHITE, -1)] = 8
 
         link_buf = ""
         link_open_split = False
